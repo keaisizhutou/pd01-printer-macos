@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from PIL import Image, ImageFont
 import pd01_mac as app
+import job_store
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -15,6 +16,9 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name)
+        self.confirmation = patch.object(job_store, 'request_confirmation', new_callable=AsyncMock, return_value=True)
+        self.confirmation.start()
+        self.addCleanup(self.confirmation.stop)
         self.font = patch.object(app.driver, '_load_font', side_effect=lambda size: ImageFont.load_default(size=size))
         self.font.start()
         self.addCleanup(self.font.stop)

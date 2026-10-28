@@ -24,6 +24,9 @@ class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name)
+        self.confirmation = patch.object(job_store, 'request_confirmation', new_callable=AsyncMock, return_value=True)
+        self.confirmation.start()
+        self.addCleanup(self.confirmation.stop)
         self.environment = patch.dict(os.environ, {'PD01_STATE_DIR': str(self.state)})
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -95,6 +98,9 @@ class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
 import asyncio, sys
 from pathlib import Path
 import job_store
+async def approve(_metadata, _png):
+    return True
+job_store.request_confirmation = approve
 async def send(_):
     with (Path(sys.argv[1]) / 'sent.txt').open('a') as out:
         out.write('sent\\n')

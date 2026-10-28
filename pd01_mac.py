@@ -55,11 +55,13 @@ def main() -> None:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("check", help="Connect and inspect the write channel without using paper")
+    actions.add_parser("setup-confirmation", help="Build the local confirmation window without printing")
+    actions.add_parser("confirm-demo", help="Show the native confirmation window without connecting or printing")
     prep = actions.add_parser("prepare", help="Render UTF-8 text to a local PNG without printing")
     prep.add_argument("--text-file", type=Path, required=True)
     prep.add_argument("--font-size", type=int, default=36)
     prep.add_argument("--align", choices=("left", "center", "right"), default="center")
-    printing = actions.add_parser("print", help="Print an approved job once")
+    printing = actions.add_parser("print", help="Open a native confirmation window, then print once if approved")
     printing.add_argument("job_id")
     printing.add_argument("--confirm", required=True)
     args = parser.parse_args()
@@ -67,6 +69,16 @@ def main() -> None:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.action == "check":
         result = asyncio.run(check(state))
+    elif args.action == "setup-confirmation":
+        from native_confirmation import build_helper
+        result = {'confirmation_helper': str(build_helper()), 'paper_used': False}
+    elif args.action == "confirm-demo":
+        from native_confirmation import request_confirmation
+        text = '这是确认窗口测试。\n点击后也不会打印。'
+        png, width, height, lines = driver.render_text(text, 36, 'center')
+        approved = asyncio.run(request_confirmation(
+            {'job_id': 'demo', 'font_size': 36, 'align': 'center'}, png, demo=True))
+        result = {'demo': True, 'button_confirmed': approved, 'paper_used': False}
     elif args.action == "prepare":
         result = prepare(state, args.text_file.read_text(encoding="utf-8"), args.font_size, args.align)
     else:

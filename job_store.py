@@ -9,6 +9,8 @@ import re
 import secrets
 import tempfile
 
+from native_confirmation import request_confirmation
+
 CONFIRMATION_TOKEN = "CONFIRM_PRINT"
 
 
@@ -84,7 +86,7 @@ def load(state: Path, job_id: str) -> tuple[dict, bytes]:
 async def dispatch(state: Path, job_id: str, confirmation: str, sender) -> dict:
     if confirmation != CONFIRMATION_TOKEN:
         raise ValueError("Show the preview and obtain explicit human approval before printing")
-    _, png = load(state, job_id)
+    metadata, png = load(state, job_id)
     folder = job_folder(state, job_id)
     attempt = folder / "attempt.json"
     try:
@@ -97,7 +99,13 @@ async def dispatch(state: Path, job_id: str, confirmation: str, sender) -> dict:
         output.flush()
         os.fsync(output.fileno())
     sync_directory(folder)
+    sending_started = False
     try:
+        if not await request_confirmation(metadata, png):
+            save_json(attempt, {"status": "cancelled_before_send"})
+            return {"job_id": job_id, "data_sent": False, "cancelled": True,
+                    "paper_used": False, "physical_output_verified": False}
+        sending_started = True
         result = await sender(png)
         save_json(attempt, {"status": "sent", "result": result})
         return {"job_id": job_id, "data_sent": True,
@@ -105,7 +113,8 @@ async def dispatch(state: Path, job_id: str, confirmation: str, sender) -> dict:
     except BaseException:
         # If saving also fails, the durable initial claim still blocks any later attempt.
         try:
-            save_json(attempt, {"status": "uncertain_do_not_retry"})
+            save_json(attempt, {"status": "uncertain_do_not_retry" if sending_started
+                               else "confirmation_failed_before_send"})
         except OSError:
             pass
         raise

@@ -475,7 +475,7 @@ async def prepare_text(text: str, font_size: int = 36, align: str = "center") ->
 
 @mcp.tool()
 async def print_prepared(job_id: str, confirmation: str) -> dict[str, Any]:
-    """Print one prepared job only after explicit human confirmation."""
+    """Open a local Mac preview window. Only the local Confirm Print button allows one send. Closing/cancelling never prints."""
     state = job_store.default_state()
     async def sender(png):
         return await send_stored_png(state, png)
