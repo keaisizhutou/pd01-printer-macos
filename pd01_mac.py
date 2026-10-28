@@ -3,48 +3,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import secrets
 import sys
 
 import printer_server as driver
+import job_store
 
-DEFAULT_STATE = Path.home() / "Library" / "Application Support" / "pd01-printer-macos"
-
-
-def save_json(path: Path, value: dict) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    path.chmod(0o600)
-
-
-def job_folder(state: Path, job_id: str) -> Path:
-    if not re.fullmatch(r"[a-f0-9]{16}", job_id):
-        raise ValueError("Invalid job ID")
-    folder = state / "jobs" / job_id
-    if not folder.is_dir():
-        raise ValueError("Unknown job ID")
-    return folder
+DEFAULT_STATE = job_store.default_state()
 
 
 def prepare(state: Path, text: str, font_size: int = 36, align: str = "center") -> dict:
     png, width, height, lines = driver.render_text(text, font_size, align)
-    job_id = secrets.token_hex(8)
-    folder = state / "jobs" / job_id
-    folder.mkdir(parents=True, mode=0o700)
-    preview = folder / "preview.png"
-    preview.write_bytes(png)
-    preview.chmod(0o600)
-    data = {
-        "job_id": job_id, "text": text, "font_size": font_size, "align": align,
-        "width": width, "height": height, "lines": lines,
-        "sha256": hashlib.sha256(png).hexdigest(),
-    }
-    save_json(folder / "job.json", data)
-    return {**data, "preview": str(preview), "paper_used": False}
+    return job_store.create(state, text, png, width, height, lines, font_size, align)
 
 
 async def check(state: Path) -> dict:
@@ -66,43 +38,16 @@ async def check(state: Path) -> dict:
             raise RuntimeError("The printer does not expose the expected write channel")
         if char.max_write_without_response_size < 123:
             raise RuntimeError("The write channel is too small for this driver's 123-byte chunks")
-        save_json(state / "device.json", {"id": device.address, "name": device.name})
+        job_store.save_json(state / "device.json", {"id": device.address, "name": device.name})
         return {"connected": bool(client.is_connected), "compatible_write_channel": True,
                 "paper_used": False}
 
 
 async def print_job(state: Path, job_id: str, confirmation: str, sender=None) -> dict:
-    if confirmation != "CONFIRM_PRINT":
-        raise ValueError("Show the preview and obtain explicit human approval before printing")
-    folder = job_folder(state, job_id)
-    data = json.loads((folder / "job.json").read_text(encoding="utf-8"))
-    png = (folder / "preview.png").read_bytes()
-    if hashlib.sha256(png).hexdigest() != data["sha256"]:
-        raise ValueError("Preview changed. Prepare a new job and ask for approval again")
     if sender is None:
-        device = json.loads((state / "device.json").read_text(encoding="utf-8"))
-        driver.DEVICE_ADDRESS = device["id"]
-        sender = driver.print_png
-    # An exclusive, durable claim prevents retries even after crashes or partial sends.
-    attempt = folder / "attempt.json"
-    try:
-        with attempt.open("x", encoding="utf-8") as output:
-            json.dump({"status": "started_outcome_unknown"}, output)
-        attempt.chmod(0o600)
-    except FileExistsError:
-        raise RuntimeError("This job has already been attempted. Inspect the paper; do not retry automatically") from None
-    try:
-        result = await sender(png)
-        save_json(attempt, {"status": "sent", "result": result})
-        return {"job_id": job_id, "data_sent": True,
-                "physical_output_verified": False, "driver_result": result}
-    except BaseException:
-        save_json(attempt, {"status": "uncertain_do_not_retry"})
-        raise
-    finally:
-        if driver.current_client is not None:
-            await driver.current_client.disconnect()
-            driver.current_client = None
+        async def sender(png):
+            return await driver.send_stored_png(state, png)
+    return await job_store.dispatch(state, job_id, confirmation, sender)
 
 
 def main() -> None:

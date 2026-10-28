@@ -5,15 +5,20 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
-import secrets
 import uuid
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from bleak import BleakClient, BleakScanner
 from fastmcp import FastMCP
+from fastmcp.tools import ToolResult
+from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image, ImageDraw, ImageFont
+from mcp.types import TextContent
+
+import job_store
 
 if os.name == "nt":
     from winrt.windows.devices.bluetooth import BluetoothCacheMode, BluetoothLEDevice
@@ -34,8 +39,6 @@ PRINT_ENERGY = int(os.getenv("PD01_PRINT_ENERGY", "32768"))
 PAPER_WIDTH = 384
 BYTES_PER_LINE = PAPER_WIDTH // 8
 MAX_TEXT_LENGTH = 2_000
-MAX_PENDING_JOBS = 20
-CONFIRMATION_TOKEN = "CONFIRM_PRINT"
 
 SERVICE_UUID = "0000ae30-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR_UUID = "0000ae01-0000-1000-8000-00805f9b34fb"
@@ -53,20 +56,6 @@ FONT_CANDIDATES = (
 mcp = FastMCP("pd01-printer")
 current_client: Any | None = None
 print_lock = asyncio.Lock()
-
-
-@dataclass
-class PreparedJob:
-    text: str
-    png_data: bytes
-    width: int
-    height: int
-    line_count: int
-    font_size: int
-    align: str
-
-
-pending_jobs: dict[str, PreparedJob] = {}
 
 
 def crc8(data: bytes) -> int:
@@ -124,20 +113,42 @@ def _wrap_text(
     font: ImageFont.FreeTypeFont,
     max_width: int,
 ) -> list[str]:
+    no_start = set(",.;:!?%)]}，。、；：？！）》」』】〕〉…")
+    no_end = set("([{（｛《「『【〔〈")
+
+    def inside_word(left: str, right: str) -> bool:
+        return all(char.isascii() and (char.isalnum() or char in "_'")
+                   for char in (left, right))
+
     wrapped: list[str] = []
-    for paragraph in text.split("\n"):
+    for paragraph in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if not paragraph:
             wrapped.append("")
             continue
-        current = ""
-        for character in paragraph:
-            candidate = current + character
-            if current and draw.textlength(candidate, font=font) > max_width:
-                wrapped.append(current)
-                current = character
-            else:
-                current = candidate
-        wrapped.append(current)
+        remainder = paragraph
+        while remainder:
+            if draw.textlength(remainder, font=font) <= max_width:
+                wrapped.append(remainder)
+                break
+            fit = 0
+            for index in range(1, len(remainder) + 1):
+                if draw.textlength(remainder[:index], font=font) > max_width:
+                    break
+                fit = index
+            if not fit:
+                raise ValueError("A character is wider than the printable area; reduce the font size")
+            boundaries = [index for index in range(fit, 0, -1)
+                          if remainder[index] not in no_start
+                          and remainder[index - 1] not in no_end]
+            preferred = [index for index in boundaries
+                         if not inside_word(remainder[index - 1], remainder[index])]
+            natural = [index for index in preferred
+                       if index >= max(1, fit // 2)
+                       and (remainder[index - 1].isspace()
+                            or remainder[index - 1] in "，。；：？！,;:!?")]
+            split_at = (natural or preferred or boundaries or [fit])[0]
+            wrapped.append(remainder[:split_at].rstrip())
+            remainder = remainder[split_at:].lstrip()
     return wrapped or [""]
 
 
@@ -371,25 +382,29 @@ async def ensure_connected() -> Any:
     return current_client
 
 
-async def print_png(png_data: bytes) -> dict[str, int | bool]:
-    global current_client
+async def print_png(png_data: bytes, device_address: str | None = None) -> dict[str, int | bool]:
+    global current_client, DEVICE_ADDRESS
     rows = png_to_rows(png_data)
     async with print_lock:
-        client = await ensure_connected()
-        data = bytearray()
-        data.extend(STATE_QUERY)
-        data.extend(QUALITY_200_DPI)
-        data.extend(set_energy(PRINT_ENERGY))
-        data.extend(APPLY_ENERGY)
-        data.extend(LATTICE_START)
-        for row in rows:
-            data.extend(print_row(row))
-        data.extend(feed_paper(25))
-        data.extend(SET_PAPER)
-        data.extend(LATTICE_END)
-        data.extend(STATE_QUERY)
-
         try:
+            if device_address is not None and device_address != DEVICE_ADDRESS:
+                if current_client is not None:
+                    await current_client.disconnect()
+                    current_client = None
+                DEVICE_ADDRESS = device_address
+            client = await ensure_connected()
+            data = bytearray()
+            data.extend(STATE_QUERY)
+            data.extend(QUALITY_200_DPI)
+            data.extend(set_energy(PRINT_ENERGY))
+            data.extend(APPLY_ENERGY)
+            data.extend(LATTICE_START)
+            for row in rows:
+                data.extend(print_row(row))
+            data.extend(feed_paper(25))
+            data.extend(SET_PAPER)
+            data.extend(LATTICE_END)
+            data.extend(STATE_QUERY)
             for offset in range(0, len(data), 123):
                 await client.write_gatt_char(
                     WRITE_CHAR_UUID,
@@ -397,53 +412,53 @@ async def print_png(png_data: bytes) -> dict[str, int | bool]:
                     response=False,
                 )
                 await asyncio.sleep(0.01)
-        except Exception:
-            try:
-                await client.disconnect()
-            finally:
-                current_client = None
-            raise
+        finally:
+            # Finish cleanup while holding the same lock as checks and disconnects.
+            if current_client is not None:
+                try:
+                    await current_client.disconnect()
+                except Exception:
+                    pass
+                finally:
+                    current_client = None
 
-    return {"printed": True, "rows": len(rows), "bytes_sent": len(data)}
+    return {"data_sent": True, "physical_output_verified": False,
+            "rows": len(rows), "bytes_sent": len(data)}
+
+
+async def send_stored_png(state: Path, png_data: bytes) -> dict:
+    address = os.getenv("PD01_DEVICE_ADDRESS", "").strip() or None
+    cached = state / "device.json"
+    if address is None and cached.exists():
+        address = json.loads(cached.read_text(encoding="utf-8"))["id"]
+    return await print_png(png_data, device_address=address)
 
 
 @mcp.tool()
 async def check_printer() -> dict[str, Any]:
     """Read-only connection check. Does not print or feed paper."""
     try:
-        client = await ensure_connected()
-        return {
-            "ok": True,
-            "device_name": DEVICE_NAME,
-            "connection": type(client).__name__,
-            "paper_used": False,
-        }
+        async with print_lock:
+            client = await ensure_connected()
+            return {
+                "ok": True,
+                "device_name": DEVICE_NAME,
+                "connection": type(client).__name__,
+                "paper_used": False,
+            }
     except Exception as error:
         return {"ok": False, "error": str(error), "paper_used": False}
 
 
 @mcp.tool()
-async def prepare_text(text: str, font_size: int = 36, align: str = "left") -> dict[str, Any]:
-    """Prepare a text job without printing. Show the returned text to the user before confirmation."""
+async def prepare_text(text: str, font_size: int = 36, align: str = "center") -> ToolResult:
+    """Prepare a durable job and return its exact PNG preview. Show image and text before asking for approval."""
     png_data, width, height, line_count = render_text(text, font_size, align)
-    job_id = secrets.token_hex(8)
-    if len(pending_jobs) >= MAX_PENDING_JOBS:
-        pending_jobs.pop(next(iter(pending_jobs)))
-    pending_jobs[job_id] = PreparedJob(
-        text=text,
-        png_data=png_data,
-        width=width,
-        height=height,
-        line_count=line_count,
-        font_size=font_size,
-        align=align,
-    )
-    return {
+    job = job_store.create(job_store.default_state(), text, png_data, width, height,
+                           line_count, font_size, align)
+    result = {
+        **job,
         "prepared": True,
-        "job_id": job_id,
-        "text": text,
-        "font_size": font_size,
-        "align": align,
         "line_count": line_count,
         "image_width": width,
         "image_height": height,
@@ -451,35 +466,32 @@ async def prepare_text(text: str, font_size: int = 36, align: str = "left") -> d
         "paper_used": False,
         "next_step": "Ask the human to confirm the exact text, then call print_prepared.",
     }
+    return ToolResult(
+        content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False)),
+                 MCPImage(data=png_data, format="png").to_image_content()],
+        structured_content=result,
+    )
 
 
 @mcp.tool()
 async def print_prepared(job_id: str, confirmation: str) -> dict[str, Any]:
     """Print one prepared job only after explicit human confirmation."""
-    if confirmation != CONFIRMATION_TOKEN:
-        return {
-            "printed": False,
-            "paper_used": False,
-            "error": f"Explicit confirmation required. Pass confirmation={CONFIRMATION_TOKEN} only after the human approves.",
-        }
-    job = pending_jobs.get(job_id)
-    if job is None:
-        return {"printed": False, "paper_used": False, "error": "Unknown or expired job_id"}
-
-    result = await print_png(job.png_data)
-    pending_jobs.pop(job_id, None)
-    return {**result, "job_id": job_id, "paper_used": True}
+    state = job_store.default_state()
+    async def sender(png):
+        return await send_stored_png(state, png)
+    return await job_store.dispatch(state, job_id, confirmation, sender)
 
 
 @mcp.tool()
 async def disconnect_printer() -> dict[str, Any]:
     """Disconnect the BLE printer. Does not print or feed paper."""
     global current_client
-    if current_client is not None:
-        try:
-            await current_client.disconnect()
-        finally:
-            current_client = None
+    async with print_lock:
+        if current_client is not None:
+            try:
+                await current_client.disconnect()
+            finally:
+                current_client = None
     return {"disconnected": True, "paper_used": False}
 
 
