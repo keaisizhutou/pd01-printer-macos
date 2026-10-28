@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+device.json
+jobs/
+*.log
+*.png
+*.jpg
+poem*.txt
+*print-attempt*.json
