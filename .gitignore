@@ -10,3 +10,7 @@ jobs/
 *.jpg
 poem*.txt
 *print-attempt*.json
+status-profile.json
+diagnostics/
+issue-report.json
+physical-outcome.json

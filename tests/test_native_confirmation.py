@@ -10,6 +10,7 @@ from PIL import ImageFont
 import job_store
 import native_confirmation as native
 import pd01_mac as cli
+from printer_faults import PrinterFault
 
 
 class NativeGateTests(unittest.IsolatedAsyncioTestCase):
@@ -92,8 +93,9 @@ class NativeGateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(native, 'build_helper', return_value=Path('/unused/helper')), \
              patch.object(native.asyncio, 'create_subprocess_exec', new_callable=AsyncMock, return_value=process), \
              patch.object(native, 'TIMEOUT_SECONDS', 0.01):
-            approved = await native.request_confirmation(self.job, Path(self.job['preview']).read_bytes())
-        self.assertFalse(approved)
+            with self.assertRaises(PrinterFault) as caught:
+                await native.request_confirmation(self.job, Path(self.job['preview']).read_bytes())
+        self.assertEqual(caught.exception.code, 'confirmation_timeout')
         self.assertTrue(process.killed)
 
 
@@ -102,21 +104,39 @@ class ApprovalResponseTests(unittest.TestCase):
         self.request = {'job_id': 'job', 'nonce': 'unique', 'sha256': 'digest', 'purpose': 'print'}
 
     def response(self, changes=None):
-        return json.dumps({**self.request, 'approved': True, **(changes or {})}).encode()
+        return json.dumps({**self.request, 'approved': True, 'reason': 'approved', **(changes or {})}).encode()
 
     def test_accepts_matching_button_result(self):
-        self.assertTrue(native.response_approved(self.response(), 0, self.request))
+        self.assertTrue(native.parse_decision(self.response(), 0, self.request))
 
     def test_old_or_other_job_approval_is_rejected(self):
         for key in self.request:
-            with self.subTest(key=key):
-                self.assertFalse(native.response_approved(self.response({key: 'other'}), 0, self.request))
+            with self.subTest(key=key), self.assertRaises(PrinterFault) as caught:
+                native.parse_decision(self.response({key: 'other'}), 0, self.request)
+            self.assertEqual(caught.exception.code, 'confirmation_response_invalid')
 
     def test_cancel_crash_and_malformed_result_are_rejected(self):
         for output, code in [(self.response({'approved': False}), 0),
                              (self.response({'approved': 'true'}), 0),
                              (self.response(), 1), (b'', 0), (b'[]', 0), (b'garbage', 0)]:
-            self.assertFalse(native.response_approved(output, code, self.request))
+            with self.assertRaises(PrinterFault):
+                native.parse_decision(output, code, self.request)
+
+    def test_cancel_and_close_are_distinct_from_helper_failure(self):
+        for reason in ('cancelled', 'window_closed'):
+            decision = native.parse_decision(self.response({'approved': False, 'reason': reason}), 0, self.request)
+            self.assertFalse(decision)
+            self.assertEqual(decision.reason, reason)
+        with self.assertRaises(PrinterFault) as caught:
+            native.parse_decision(b'', 1, self.request)
+        self.assertEqual(caught.exception.code, 'confirmation_window_failed')
+
+    def test_matching_approval_must_have_an_approval_reason(self):
+        decision = native.parse_decision(self.response({'reason': 'approved'}), 0, self.request)
+        self.assertTrue(decision)
+        with self.assertRaises(PrinterFault) as caught:
+            native.parse_decision(self.response({'reason': 'cancelled'}), 0, self.request)
+        self.assertEqual(caught.exception.code, 'confirmation_response_invalid')
 
 
 if __name__ == '__main__':

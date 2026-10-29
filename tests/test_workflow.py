@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from PIL import Image, ImageFont
 import pd01_mac as app
 import job_store
+from printer_faults import PrinterFault
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -40,8 +41,9 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmation_required_before_sender(self):
         job = self.prepared()
         sender = AsyncMock()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(PrinterFault) as caught:
             await app.print_job(self.state, job['job_id'], 'yes', sender)
+        self.assertEqual(caught.exception.code, 'confirmation_required')
         sender.assert_not_called()
 
     async def test_print_uses_exact_preview_and_cannot_replay(self):
@@ -82,15 +84,30 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         job = self.prepared()
         Path(job['preview']).write_bytes(b'changed')
         sender = AsyncMock()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(PrinterFault) as caught:
             await app.print_job(self.state, job['job_id'], 'CONFIRM_PRINT', sender)
+        self.assertEqual(caught.exception.code, 'preview_changed')
         sender.assert_not_called()
 
     async def test_reject_job_path_traversal(self):
         sender = AsyncMock()
-        with self.assertRaises(ValueError):
+        with self.assertRaises(PrinterFault) as caught:
             await app.print_job(self.state, '../../outside', 'CONFIRM_PRINT', sender)
+        self.assertEqual(caught.exception.code, 'job_id_invalid')
         sender.assert_not_called()
+
+    async def test_preflight_fault_is_recorded_as_blocked_and_never_retried(self):
+        job = self.prepared()
+        sender = AsyncMock(side_effect=PrinterFault('paper_missing', '打印机缺纸', '请装纸。'))
+        with self.assertRaises(PrinterFault):
+            await app.print_job(self.state, job['job_id'], 'CONFIRM_PRINT', sender)
+        record = json.loads((Path(job['preview']).parent / 'attempt.json').read_text())
+        self.assertEqual(record['status'], 'blocked_before_send')
+        self.assertEqual(record['error']['error_code'], 'paper_missing')
+        self.assertFalse(record['error']['paper_used'])
+        with self.assertRaises(RuntimeError):
+            await app.print_job(self.state, job['job_id'], 'CONFIRM_PRINT', sender)
+        self.assertEqual(sender.await_count, 1)
 
 
 if __name__ == '__main__':

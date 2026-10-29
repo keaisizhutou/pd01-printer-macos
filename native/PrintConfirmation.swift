@@ -50,7 +50,7 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
             : "请核对下面的实际预览。点击确认后，将向打印机发送 1 张。")
         subtitle.textColor = .secondaryLabelColor
         let alignment = ["left": "左对齐", "center": "居中", "right": "右对齐"][request.align] ?? request.align
-        let summary = request.kind == "image" ? "黑白图片  ·  1 张" : "字号 \(request.fontSize ?? 36)  ·  \(alignment)  ·  1 张"
+        let summary = request.kind == "image" ? "黑白图片  ·  1 张" : request.kind == "mixed" ? "图文混排  ·  1 张" : "字号 \(request.fontSize ?? 36)  ·  \(alignment)  ·  1 张"
         let details = NSTextField(labelWithString: summary)
         details.font = .systemFont(ofSize: 13, weight: .medium)
 
@@ -109,17 +109,18 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc func approved() { finish(approved: true) }
-    @objc func cancelled() { finish(approved: false) }
-    func windowWillClose(_ notification: Notification) { finish(approved: false) }
+    @objc func approved() { finish(approved: true, reason: "approved") }
+    @objc func cancelled() { finish(approved: false, reason: "cancelled") }
+    func windowWillClose(_ notification: Notification) { finish(approved: false, reason: "window_closed") }
 
-    func finish(approved: Bool) {
+    func finish(approved: Bool, reason: String) {
         guard !finished else { return }
         finished = true
         confirmButton.isEnabled = false
         let response: [String: Any] = [
             "approved": approved, "job_id": request.jobID,
-            "nonce": request.nonce, "sha256": request.sha256, "purpose": request.purpose
+            "nonce": request.nonce, "sha256": request.sha256, "purpose": request.purpose,
+            "reason": reason
         ]
         if let data = try? JSONSerialization.data(withJSONObject: response) {
             FileHandle.standardOutput.write(data)

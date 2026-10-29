@@ -9,4 +9,8 @@ The BLE transport, raster protocol, CRC and text renderer originate from upstrea
 
 The local CLI also supports preparing image files as 384-dot monochrome jobs, with transparent areas composited on white and the same preview/approval/send path as text.
 
+Further adaptations add ordered text/image layouts to CLI and MCP, preparation limits and actionable errors, durable job-phase queries, and device-bound fault calibration from controlled local observations. Only validated status flags are interpreted. Optional standardized battery reads do not infer battery or temperature from undocumented status bytes. Sending data and receiving status are not treated as proof of physical paper output.
+
+Reported blank-output troubleshooting is available through CLI and MCP. It inspects the saved preview and returns paper-loading checks without diagnosing a reversed roll from sensor data or triggering another print.
+
 Upstream credits [rhnvrm/catprinter](https://github.com/rhnvrm/catprinter) (MIT) for public reverse-engineering work on command framing and GATT details. The original copyright and MIT license are retained in LICENSE.

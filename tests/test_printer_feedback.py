@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import printer_server as driver
+from printer_faults import PrinterFault
 
 
 def reply_frame(code, payload=b'\x00'):
@@ -58,12 +59,16 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(writes[-1], driver.STATE_QUERY)
                 self.assertNotIn('device_completion_reported', result)
             elif answer:
-                with self.assertRaisesRegex(RuntimeError, 'Output is uncertain'):
+                with self.assertRaises(PrinterFault) as caught:
                     await driver.print_png(b'fake')
+                self.assertTrue(caught.exception.output_uncertain)
+                self.assertEqual(caught.exception.code, 'status_lost_after_send')
                 self.assertGreater(len(writes), 1)
             else:
-                with self.assertRaisesRegex(RuntimeError, 'no image data was sent'):
+                with self.assertRaises(PrinterFault) as caught:
                     await driver.print_png(b'fake')
+                self.assertFalse(caught.exception.output_uncertain)
+                self.assertEqual(caught.exception.code, 'status_timeout')
                 self.assertEqual(writes, [driver.STATE_QUERY])
         client.stop_notify.assert_awaited_once()
         client.disconnect.assert_awaited_once()

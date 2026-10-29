@@ -17,6 +17,7 @@ from PIL import Image, ImageFont
 import job_store
 import pd01_mac as cli
 import printer_server as server
+from printer_faults import PrinterFault
 
 
 class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -60,7 +61,28 @@ class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             )
         self.assertEqual(sender.await_count, 1)
-        self.assertEqual(sum(isinstance(item, RuntimeError) for item in outcomes), 1)
+        rejected = [item for item in outcomes if isinstance(item, PrinterFault)
+                    or isinstance(item, dict) and item.get('error_code') == 'job_already_attempted']
+        self.assertEqual(len(rejected), 1)
+
+    async def test_image_and_mixed_mcp_tools_return_the_exact_shared_job_preview_without_sending(self):
+        image = self.state / 'square.png'
+        Image.new('1', (80, 80), 0).save(image)
+        with patch.object(server, 'send_stored_png', new_callable=AsyncMock) as sender:
+            async with Client(server.mcp) as client:
+                cases = [('prepare_image', {'image_file': str(image)}, 'image'),
+                         ('prepare_mixed', {'base_dir': str(self.state), 'blocks': [
+                             {'type': 'text', 'text': 'Title', 'font_size': 36},
+                             {'type': 'image', 'path': 'square.png', 'width': 120}]}, 'mixed')]
+                for tool, arguments, kind in cases:
+                    result = await client.call_tool(tool, arguments)
+                    data = result.structured_content
+                    self.assertEqual(data['kind'], kind)
+                    png = base64.b64decode(next(block.data for block in result.content if block.type == 'image'))
+                    self.assertEqual(png, Path(data['preview']).read_bytes())
+                    self.assertFalse(data['paper_used'])
+                    self.assertFalse((Path(data['preview']).parent / 'attempt.json').exists())
+        sender.assert_not_called()
 
     async def test_mcp_failure_remains_blocked_after_new_client(self):
         job = cli.prepare(self.state, 'A poem')
@@ -69,11 +91,12 @@ class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
             async with Client(server.mcp) as client:
                 result = await client.call_tool('print_prepared',
                     {'job_id': job['job_id'], 'confirmation': 'CONFIRM_PRINT'}, raise_on_error=False)
-                self.assertTrue(result.is_error)
+                self.assertFalse(result.structured_content['ok'])
+                self.assertEqual(result.structured_content['status'], 'output_uncertain')
             async with Client(server.mcp) as client:
                 result = await client.call_tool('print_prepared',
                     {'job_id': job['job_id'], 'confirmation': 'CONFIRM_PRINT'}, raise_on_error=False)
-                self.assertTrue(result.is_error)
+                self.assertEqual(result.structured_content['error_code'], 'job_already_attempted')
             self.assertEqual(sender.await_count, 1)
 
     async def test_cancellation_blocks_retry(self):
@@ -123,9 +146,33 @@ except RuntimeError:
     async def test_mcp_wrong_confirmation_never_sends(self):
         job = cli.prepare(self.state, 'A poem')
         with patch.object(server, 'send_stored_png', new_callable=AsyncMock) as sender:
-            with self.assertRaises(ValueError):
-                await server.print_prepared(job['job_id'], 'yes')
+            result = await server.print_prepared(job['job_id'], 'yes')
+            self.assertEqual(result['error_code'], 'confirmation_required')
             sender.assert_not_called()
+
+    async def test_printer_fault_returns_actionable_mcp_result_and_blocked_record(self):
+        job = cli.prepare(self.state, 'A poem')
+        fault = PrinterFault('paper_or_cover_problem', '缺纸或纸仓未扣好', '检查纸张并扣好纸仓。')
+        with patch.object(server, 'send_stored_png', new_callable=AsyncMock, side_effect=fault):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool('print_prepared', {
+                    'job_id': job['job_id'], 'confirmation': 'CONFIRM_PRINT'})
+        data = result.structured_content
+        self.assertFalse(data['ok'])
+        self.assertFalse(data['data_sent'])
+        self.assertEqual(data['message'], '缺纸或纸仓未扣好')
+        self.assertTrue(data['action'])
+        self.assertFalse(data['automatic_retry'])
+        record = json.loads((Path(job['preview']).parent / 'attempt.json').read_text())
+        self.assertEqual(record['status'], 'blocked_before_send')
+
+    async def test_status_connection_fault_returns_actionable_mcp_result(self):
+        fault = PrinterFault('printer_unavailable', '无法发现或连接打印机', '检查电源和蓝牙。')
+        with patch.object(server, 'diagnose_printer', new_callable=AsyncMock, side_effect=fault):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool('check_printer', {})
+        self.assertEqual(result.structured_content['error_code'], 'printer_unavailable')
+        self.assertFalse(result.structured_content['paper_used'])
 
     async def test_transport_reports_send_and_cleans_up_under_lock(self):
         async def disconnected():

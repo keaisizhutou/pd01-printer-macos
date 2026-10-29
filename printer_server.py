@@ -19,6 +19,9 @@ from PIL import Image, ImageDraw, ImageFont
 from mcp.types import TextContent
 
 import job_store
+from printer_faults import PrinterFault, fault, normalize_error, interpret_status, load_profile, raise_for_faults
+from print_layout import PAPER_WIDTH, check_height, image_raster, png_bytes, mixed_raster
+from printer_telemetry import read_battery
 
 if os.name == "nt":
     from winrt.windows.devices.bluetooth import BluetoothCacheMode, BluetoothLEDevice
@@ -36,7 +39,6 @@ MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "4176"))
 PRINT_ENERGY = int(os.getenv("PD01_PRINT_ENERGY", "32768"))
 
-PAPER_WIDTH = 384
 BYTES_PER_LINE = PAPER_WIDTH // 8
 MAX_TEXT_LENGTH = 2_000
 
@@ -78,12 +80,15 @@ def command(code: int, payload: bytes = b"") -> bytes:
 
 class PrinterFeedback:
     """Parse fragmented/combined notifications without claiming physical paper output."""
-    def __init__(self):
+    def __init__(self, status_profile: dict | None = None):
         self.buffer = bytearray()
         self.state_received = asyncio.Event()
         self.state_replies = 0
+        self.state_payloads = []
         self.commands = set()
         self.ready_reported = False
+        self.status_profile = status_profile
+        self.fault_reported = None
 
     def receive(self, _characteristic, data):
         self.buffer.extend(data)
@@ -112,7 +117,15 @@ class PrinterFeedback:
                 continue
             self.commands.add(frame[2])
             if frame[2] == 0xA3:
+                if not payload:
+                    continue
                 self.state_replies += 1
+                self.state_payloads.append(payload)
+                self.state_payloads = self.state_payloads[-16:]
+                status = interpret_status(payload, self.status_profile)
+                if status["faults"]:
+                    # A recovery notification must not erase an error seen during this job.
+                    self.fault_reported = status
                 self.state_received.set()
             elif frame[2] == 0xAE and payload == b"\x00":
                 self.ready_reported = True
@@ -147,10 +160,11 @@ def feed_paper(lines: int = 25) -> bytes:
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     for path in FONT_CANDIDATES:
         if path and os.path.exists(path):
-            return ImageFont.truetype(path, size=size)
-    raise RuntimeError(
-        "No usable font found. Set PD01_FONT_PATH to a TTF/TTC font that supports your text."
-    )
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                raise fault("font_unavailable") from None
+    raise fault("font_unavailable")
 
 
 def _wrap_text(
@@ -182,7 +196,7 @@ def _wrap_text(
                     break
                 fit = index
             if not fit:
-                raise ValueError("A character is wider than the printable area; reduce the font size")
+                raise fault("glyph_too_wide")
             boundaries = [index for index in range(fit, 0, -1)
                           if remainder[index] not in no_start
                           and remainder[index - 1] not in no_end]
@@ -199,14 +213,14 @@ def _wrap_text(
 
 
 def render_text(text: str, font_size: int, align: str) -> tuple[bytes, int, int, int]:
-    if not text.strip():
-        raise ValueError("Text cannot be empty")
+    if not isinstance(text, str) or not text.strip():
+        raise fault("text_empty")
     if len(text) > MAX_TEXT_LENGTH:
-        raise ValueError(f"Text is too long; maximum length is {MAX_TEXT_LENGTH} characters")
-    if not 12 <= font_size <= 72:
-        raise ValueError("font_size must be between 12 and 72")
+        raise fault("text_too_long")
+    if not isinstance(font_size, int) or isinstance(font_size, bool) or not 12 <= font_size <= 72:
+        raise fault("font_size_invalid")
     if align not in {"left", "center", "right"}:
-        raise ValueError("align must be left, center, or right")
+        raise fault("alignment_invalid")
 
     font = _load_font(font_size)
     padding_x = 20
@@ -218,6 +232,7 @@ def render_text(text: str, font_size: int, align: str) -> tuple[bytes, int, int,
     bbox = font.getbbox("Ag国")
     line_height = bbox[3] - bbox[1] + line_spacing
     total_height = max(1, padding_y * 2 + line_height * len(lines))
+    check_height(total_height)
 
     image = Image.new("L", (PAPER_WIDTH, total_height), 255)
     draw = ImageDraw.Draw(image)
@@ -414,10 +429,8 @@ async def connect_device() -> Any:
     except Exception as error:
         errors.append(f"BLE scan: {error}")
 
-    raise RuntimeError(
-        f"Could not connect to {DEVICE_NAME}. Wake the printer and close its phone app. "
-        + "; ".join(errors)
-    )
+    raise PrinterFault("printer_unavailable", "无法发现或连接打印机",
+                       "确认打印机开机并靠近 Mac，关闭占用它的手机打印 App，再检查蓝牙权限。")
 
 
 async def ensure_connected() -> Any:
@@ -428,14 +441,90 @@ async def ensure_connected() -> Any:
     return current_client
 
 
-async def print_png(png_data: bytes, device_address: str | None = None) -> dict[str, Any]:
+def configured_address(state: Path) -> str | None:
+    address = os.getenv("PD01_DEVICE_ADDRESS", "").strip() or None
+    cached = state / "device.json"
+    if address is None and cached.exists():
+        address = json.loads(cached.read_text(encoding="utf-8"))["id"]
+    return address
+
+
+async def diagnose_printer(state: Path, samples: int = 1) -> dict:
+    """Read A3 status only. No image, feed, energy or print commands are sent."""
     global current_client, DEVICE_ADDRESS
-    rows = png_to_rows(png_data)
+    if not 1 <= samples <= 10:
+        raise ValueError("samples must be between 1 and 10")
+    address = configured_address(state)
+    profile = load_profile(state, address)
     feedback = PrinterFeedback()
     listening = False
-    post_send_reply = False
     async with print_lock:
         try:
+            if address is not None and address != DEVICE_ADDRESS:
+                if current_client is not None:
+                    await current_client.disconnect()
+                    current_client = None
+                DEVICE_ADDRESS = address
+            client = await ensure_connected()
+            if not hasattr(client, "start_notify"):
+                raise PrinterFault("status_unsupported", "当前连接方式不支持读取设备状态",
+                                   "请使用支持通知的 Mac 蓝牙连接；目前不能判断纸张或纸仓状态。")
+            await client.start_notify(NOTIFY_CHAR_UUID, feedback.receive)
+            listening = True
+            payloads = []
+            for _ in range(samples):
+                feedback.state_received.clear()
+                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
+                try:
+                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态",
+                                       "检查设备是否休眠或被其他 App 占用；当前不能判定纸张状态。") from None
+                payloads.append(feedback.state_payloads[-1])
+                if len(payloads) < samples:
+                    await asyncio.sleep(0.3)
+            status = interpret_status(payloads[-1], profile)
+            calibration_unavailable = (state / "status-profile.json").exists() and profile is None
+            if calibration_unavailable:
+                status["summary"] = "已配置的故障检查规则不可用，打印将被阻止；请重新校准"
+            return {"reachable": True, "paper_used": False,
+                    "status_samples": [payload.hex() for payload in payloads], **status,
+                    "ok": not status["faults"] and not calibration_unavailable,
+                    "calibration_available": profile is not None,
+                    "calibration_required": calibration_unavailable,
+                    "battery": await read_battery(client)}
+        except PrinterFault:
+            raise
+        except Exception as error:
+            raise PrinterFault("status_query_failed", "无法读取打印机状态",
+                               "检查打印机电源、蓝牙占用和权限；当前不能判断纸张或纸仓状态。") from error
+        finally:
+            if current_client is not None:
+                if listening:
+                    try:
+                        await current_client.stop_notify(NOTIFY_CHAR_UUID)
+                    except Exception:
+                        pass
+                try:
+                    await current_client.disconnect()
+                except Exception:
+                    pass
+                finally:
+                    current_client = None
+
+
+async def print_png(png_data: bytes, device_address: str | None = None,
+                    status_profile: dict | None = None) -> dict[str, Any]:
+    global current_client, DEVICE_ADDRESS
+    rows = png_to_rows(png_data)
+    feedback = PrinterFeedback(status_profile)
+    listening = False
+    post_send_reply = False
+    bytes_queued = 0
+    status = interpret_status(b"", status_profile)
+    async with print_lock:
+        try:
+            job_store.report_progress("checking_printer")
             if device_address is not None and device_address != DEVICE_ADDRESS:
                 if current_client is not None:
                     await current_client.disconnect()
@@ -449,8 +538,14 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
                 try:
                     await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
-                    raise RuntimeError("Printer did not answer the preflight status query; no image data was sent") from None
+                    raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态；本次未发送打印数据",
+                                       "检查设备是否休眠或被其他 App 占用，当前无法判断纸张和纸仓状态。") from None
+                status = interpret_status(feedback.state_payloads[-1], status_profile)
+                raise_for_faults(feedback.fault_reported or status, phase="preflight", output_uncertain=False)
                 feedback.state_received.clear()
+            elif status_profile and status_profile.get("rules"):
+                raise PrinterFault("status_unsupported", "当前连接不能执行已启用的故障检查，已停止打印",
+                                   "请恢复支持设备状态通知的连接后重试。")
             data = bytearray()
             data.extend(STATE_QUERY)
             data.extend(QUALITY_200_DPI)
@@ -464,6 +559,12 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
             data.extend(LATTICE_END)
             data.extend(STATE_QUERY)
             for offset in range(0, len(data), 123):
+                if offset == 0:
+                    job_store.report_progress("sending")
+                if feedback.state_payloads:
+                    status = interpret_status(feedback.state_payloads[-1], status_profile)
+                    raise_for_faults(feedback.fault_reported or status, phase="sending", output_uncertain=bytes_queued > 0)
+                bytes_queued += len(data[offset : offset + 123])
                 await client.write_gatt_char(
                     WRITE_CHAR_UUID,
                     data[offset : offset + 123],
@@ -473,13 +574,30 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
             # Writes without response only enqueue data. Keep BLE open while the tail drains.
             await asyncio.sleep(TAIL_DRAIN_SECONDS)
             if listening:
+                job_store.report_progress("awaiting_device_reply")
                 feedback.state_received.clear()
                 await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
                 try:
                     await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
                     post_send_reply = True
                 except asyncio.TimeoutError:
-                    raise RuntimeError("Image bytes were queued but the printer stopped replying. Output is uncertain; inspect the paper before any retry") from None
+                    raise PrinterFault("status_lost_after_send", "打印数据已发送，但设备停止返回状态，出纸结果不确定",
+                                       "请先检查打印机和纸张，程序不会自动重打。",
+                                       phase="post_send", output_uncertain=True) from None
+                status = interpret_status(feedback.state_payloads[-1], status_profile)
+                raise_for_faults(feedback.fault_reported or status, phase="post_send", output_uncertain=True)
+        except PrinterFault:
+            raise
+        except Exception as error:
+            normalized = normalize_error(error, phase="sending" if bytes_queued else "preflight",
+                                         output_uncertain=bool(bytes_queued))
+            if normalized.code.startswith("storage_"):
+                raise normalized from error
+            raise PrinterFault("transfer_failed" if bytes_queued else "printer_check_failed",
+                               "蓝牙发送中断，出纸结果不确定" if bytes_queued else "打印前设备检查失败，未发送打印数据",
+                               "检查打印机电源、距离和蓝牙占用；如已开始出纸，请先核对实物，程序不会自动重打。",
+                               phase="sending" if bytes_queued else "preflight",
+                               output_uncertain=bool(bytes_queued)) from error
         finally:
             # Finish cleanup while holding the same lock as checks and disconnects.
             if current_client is not None:
@@ -499,48 +617,47 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
             "rows": len(rows), "bytes_sent": len(data),
             "device_reply_after_send": post_send_reply,
             "device_ready_reported": feedback.ready_reported,
+            "printer_status": status,
             "feedback_commands": [f"{code:02x}" for code in sorted(feedback.commands)]}
 
 
 async def send_stored_png(state: Path, png_data: bytes) -> dict:
-    address = os.getenv("PD01_DEVICE_ADDRESS", "").strip() or None
-    cached = state / "device.json"
-    if address is None and cached.exists():
-        address = json.loads(cached.read_text(encoding="utf-8"))["id"]
-    return await print_png(png_data, device_address=address)
+    address = configured_address(state)
+    profile = load_profile(state, address)
+    if (state / "status-profile.json").exists() and profile is None:
+        raise fault("calibration_unavailable", phase="preflight")
+    return await print_png(png_data, device_address=address, status_profile=profile)
 
 
 @mcp.tool()
 async def check_printer() -> dict[str, Any]:
-    """Read-only connection check. Does not print or feed paper."""
+    """Query device status and report validated faults. Does not print or feed paper."""
     try:
-        async with print_lock:
-            client = await ensure_connected()
-            return {
-                "ok": True,
-                "device_name": DEVICE_NAME,
-                "connection": type(client).__name__,
-                "paper_used": False,
-            }
+        return await diagnose_printer(job_store.default_state())
+    except PrinterFault as error:
+        return error.as_result()
     except Exception as error:
-        return {"ok": False, "error": str(error), "paper_used": False}
+        return normalize_error(error, phase="preflight").as_result()
 
 
-@mcp.tool()
-async def prepare_text(text: str, font_size: int = 36, align: str = "center") -> ToolResult:
+def _prepare_text_result(text: str, font_size: int = 36, align: str = "center") -> ToolResult:
     """Prepare a durable job and return its exact PNG preview. Show image and text before asking for approval."""
     png_data, width, height, line_count = render_text(text, font_size, align)
     job = job_store.create(job_store.default_state(), text, png_data, width, height,
                            line_count, font_size, align)
+    return _prepared_job_result(job, png_data)
+
+
+def _prepared_job_result(job: dict, png_data: bytes) -> ToolResult:
     result = {
         **job,
         "prepared": True,
-        "line_count": line_count,
-        "image_width": width,
-        "image_height": height,
-        "estimated_length_mm": round(height / 8, 1),
+        "line_count": job["lines"],
+        "image_width": job["width"],
+        "image_height": job["height"],
+        "estimated_length_mm": round(job["height"] / 8, 1),
         "paper_used": False,
-        "next_step": "Ask the human to confirm the exact text, then call print_prepared.",
+        "next_step": "展示实际预览和完整文字，取得用户同意后调用 print_prepared；仍需点击本机确认按钮。",
     }
     return ToolResult(
         content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False)),
@@ -550,12 +667,69 @@ async def prepare_text(text: str, font_size: int = 36, align: str = "center") ->
 
 
 @mcp.tool()
+async def prepare_text(text: str, font_size: int = 36, align: str = "center") -> ToolResult:
+    """Prepare a durable text job and exact PNG preview; return actionable preparation errors without printing."""
+    try:
+        return _prepare_text_result(text, font_size, align)
+    except Exception as error:
+        return ToolResult(structured_content=normalize_error(error).as_result())
+
+
+@mcp.tool()
+async def prepare_image(image_file: str) -> ToolResult:
+    """Prepare a local image file and exact monochrome PNG preview. Does not connect or print."""
+    try:
+        raster = image_raster(Path(image_file).expanduser())
+        png = png_bytes(raster)
+        job = job_store.create(job_store.default_state(), "图片打印", png, raster.width,
+                               raster.height, 0, None, "center", kind="image")
+        return _prepared_job_result(job, png)
+    except Exception as error:
+        return ToolResult(structured_content=normalize_error(error).as_result())
+
+
+@mcp.tool()
+async def prepare_mixed(blocks: list[dict[str, Any]], base_dir: str = ".") -> ToolResult:
+    """Prepare ordered text/image/spacer blocks and exact PNG preview. Image paths are local, relative to base_dir. Does not print."""
+    try:
+        png, width, height, text = mixed_raster(blocks, Path(base_dir).expanduser(), render_text)
+        job = job_store.create(job_store.default_state(), text, png, width, height,
+                               0, None, "center", kind="mixed")
+        return _prepared_job_result(job, png)
+    except Exception as error:
+        return ToolResult(structured_content=normalize_error(error).as_result())
+
+
+@mcp.tool()
+async def get_job_status(job_id: str) -> dict[str, Any]:
+    """Read a saved job phase or actionable fault without connecting to or printing on the device."""
+    try:
+        return job_store.read_status(job_store.default_state(), job_id)
+    except Exception as error:
+        return normalize_error(error).as_result()
+
+
+@mcp.tool()
+async def report_blank_output(job_id: str) -> dict[str, Any]:
+    """Use only when the user reports paper fed but blank output. Save a client report and return checks, never a sensor diagnosis. Does not connect, feed or reprint."""
+    try:
+        return job_store.report_blank_output(job_store.default_state(), job_id)
+    except Exception as error:
+        return normalize_error(error).as_result()
+
+
+@mcp.tool()
 async def print_prepared(job_id: str, confirmation: str) -> dict[str, Any]:
     """Open a local Mac preview window. Only the local Confirm Print button allows one send. Closing/cancelling never prints."""
     state = job_store.default_state()
     async def sender(png):
         return await send_stored_png(state, png)
-    return await job_store.dispatch(state, job_id, confirmation, sender)
+    try:
+        return await job_store.dispatch(state, job_id, confirmation, sender)
+    except PrinterFault as error:
+        return error.as_result()
+    except Exception as error:
+        return normalize_error(error, phase="preflight").as_result()
 
 
 @mcp.tool()

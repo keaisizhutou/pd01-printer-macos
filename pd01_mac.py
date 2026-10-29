@@ -4,14 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import io
 import os
 from pathlib import Path
 import sys
 
 import printer_server as driver
 import job_store
-from PIL import Image
+from print_layout import image_raster, png_bytes, mixed_raster
+from printer_faults import PrinterFault, fault, normalize_error
 
 DEFAULT_STATE = job_store.default_state()
 
@@ -23,39 +23,59 @@ def prepare(state: Path, text: str, font_size: int = 36, align: str = "center") 
 
 def prepare_image(state: Path, source_path: Path) -> dict:
     """Rasterize an image to the printer width; preview and sent pixels remain identical."""
-    with Image.open(source_path) as source:
-        rgba = source.convert("RGBA")
-    white = Image.new("RGBA", rgba.size, "white")
-    white.alpha_composite(rgba)
-    gray = white.convert("L")
-    height = max(1, round(gray.height * driver.PAPER_WIDTH / gray.width))
-    gray = gray.resize((driver.PAPER_WIDTH, height), Image.Resampling.LANCZOS)
-    raster = gray.point(lambda value: 0 if value < 160 else 255, mode="1")
-    output = io.BytesIO()
-    raster.save(output, format="PNG")
-    return job_store.create(state, "图片打印", output.getvalue(), raster.width,
+    raster = image_raster(source_path)
+    return job_store.create(state, "图片打印", png_bytes(raster), raster.width,
                             raster.height, 0, None, "center", kind="image")
+
+
+def read_input(path: Path) -> str:
+    try:
+        if path.stat().st_size > 1_000_000:
+            raise fault("input_too_large")
+        return path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        raise fault("input_file_not_found") from None
+    except UnicodeError:
+        raise fault("input_invalid") from None
+
+
+def prepare_mixed(state: Path, manifest: Path) -> dict:
+    try:
+        layout = json.loads(read_input(manifest))
+    except ValueError:
+        raise fault("layout_invalid") from None
+    blocks = layout.get("blocks") if isinstance(layout, dict) else layout
+    png, width, height, text = mixed_raster(blocks, manifest.resolve().parent, driver.render_text)
+    return job_store.create(state, text, png, width, height, 0, None, "center", kind="mixed")
 
 
 async def check(state: Path) -> dict:
     from bleak import BleakClient, BleakScanner
-    discovered = await BleakScanner.discover(timeout=10, return_adv=True)
+    try:
+        discovered = await BleakScanner.discover(timeout=10, return_adv=True)
+    except Exception as error:
+        raise PrinterFault("printer_search_failed", "蓝牙扫描失败",
+                           "检查 Mac 蓝牙是否开启，以及当前程序是否有蓝牙权限。") from error
     devices = [device for device, adv in discovered.values()
                if (adv.local_name or device.name or "") == driver.DEVICE_NAME]
     requested_id = os.getenv("PD01_DEVICE_ADDRESS", "").strip()
     if requested_id:
         devices = [device for device in devices if device.address == requested_id]
     if not devices:
-        raise RuntimeError("No PD01 found. Wake it, close the phone app, and check Bluetooth permission.")
+        raise PrinterFault("printer_not_found", "没有发现目标打印机",
+                           "唤醒打印机并靠近 Mac，关闭手机打印 App，再检查蓝牙权限。")
     if len(devices) != 1:
-        raise RuntimeError("Multiple PD01 devices found. Turn off the others or set PD01_DEVICE_ADDRESS.")
+        raise PrinterFault("multiple_printers_found", "发现多台同名打印机，尚未选择目标",
+                           "关闭其他同名设备，或先指定要使用的打印机。")
     device = devices[0]
     async with BleakClient(device, timeout=20) as client:
         char = client.services.get_characteristic(driver.WRITE_CHAR_UUID)
         if char is None or "write-without-response" not in char.properties:
-            raise RuntimeError("The printer does not expose the expected write channel")
+            raise PrinterFault("write_channel_unavailable", "设备没有提供兼容的打印通道",
+                               "确认设备型号与本项目兼容，不要向未识别通道发送打印指令。")
         if char.max_write_without_response_size < 123:
-            raise RuntimeError("The write channel is too small for this driver's 123-byte chunks")
+            raise PrinterFault("write_chunk_unsupported", "设备的蓝牙写入容量不满足当前驱动要求",
+                               "暂时停止发送，需要适配该设备的分包大小。")
         job_store.save_json(state / "device.json", {"id": device.address, "name": device.name})
         return {"connected": bool(client.is_connected), "compatible_write_channel": True,
                 "paper_used": False}
@@ -73,6 +93,10 @@ def main() -> None:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("check", help="Connect and inspect the write channel without using paper")
+    status_action = actions.add_parser("status", help="Query printer status without printing or feeding paper")
+    status_action.add_argument("--samples", type=int, default=1)
+    status_action.add_argument("--sample-label", choices=("normal", "cover_open", "paper_missing", "recovered"))
+    actions.add_parser("calibrate-status", help="Validate four controlled status sample sets and save local fault rules")
     actions.add_parser("setup-confirmation", help="Build the local confirmation window without printing")
     actions.add_parser("confirm-demo", help="Show the native confirmation window without connecting or printing")
     prep = actions.add_parser("prepare", help="Render UTF-8 text to a local PNG without printing")
@@ -81,6 +105,12 @@ def main() -> None:
     prep.add_argument("--align", choices=("left", "center", "right"), default="center")
     image_prep = actions.add_parser("prepare-image", help="Prepare a black-and-white image preview without printing")
     image_prep.add_argument("--image-file", type=Path, required=True)
+    mixed_prep = actions.add_parser("prepare-mixed", help="Prepare a text/image receipt from a local JSON manifest")
+    mixed_prep.add_argument("--manifest", type=Path, required=True)
+    job_status = actions.add_parser("job-status", help="Read the saved job phase and any actionable error")
+    job_status.add_argument("job_id")
+    blank_report = actions.add_parser("report-blank", help="Record reported blank output and return troubleshooting advice; never prints")
+    blank_report.add_argument("job_id")
     printing = actions.add_parser("print", help="Open a native confirmation window, then print once if approved")
     printing.add_argument("job_id")
     printing.add_argument("--confirm", required=True)
@@ -89,28 +119,59 @@ def main() -> None:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.action == "check":
         result = asyncio.run(check(state))
+    elif args.action == "status":
+        result = asyncio.run(driver.diagnose_printer(state, args.samples))
+        if args.sample_label:
+            from datetime import datetime, timezone
+            import hashlib
+            folder = state / "diagnostics"
+            folder.mkdir(exist_ok=True, mode=0o700)
+            record = {"label": args.sample_label, "samples": result["status_samples"],
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                      "device_id_sha256": hashlib.sha256(driver.configured_address(state).encode()).hexdigest()}
+            job_store.save_json(folder / f'{args.sample_label}.json', record)
     elif args.action == "setup-confirmation":
         from native_confirmation import build_helper
         result = {'confirmation_helper': str(build_helper()), 'paper_used': False}
+    elif args.action == "calibrate-status":
+        from status_calibration import calibrate
+        try:
+            result = calibrate(state, driver.configured_address(state))
+        except FileNotFoundError:
+            raise fault("calibration_samples_missing") from None
+        except (ValueError, KeyError, TypeError):
+            raise fault("calibration_invalid_samples") from None
     elif args.action == "confirm-demo":
         from native_confirmation import request_confirmation
         text = '这是确认窗口测试。\n点击后也不会打印。'
         png, width, height, lines = driver.render_text(text, 36, 'center')
         approved = asyncio.run(request_confirmation(
             {'job_id': 'demo', 'font_size': 36, 'align': 'center'}, png, demo=True))
-        result = {'demo': True, 'button_confirmed': approved, 'paper_used': False}
+        result = {'demo': True, 'button_confirmed': bool(approved), 'paper_used': False}
     elif args.action == "prepare":
-        result = prepare(state, args.text_file.read_text(encoding="utf-8"), args.font_size, args.align)
+        result = prepare(state, read_input(args.text_file), args.font_size, args.align)
     elif args.action == "prepare-image":
         result = prepare_image(state, args.image_file)
+    elif args.action == "prepare-mixed":
+        result = prepare_mixed(state, args.manifest)
+    elif args.action == "job-status":
+        result = job_store.read_status(state, args.job_id)
+    elif args.action == "report-blank":
+        result = job_store.report_blank_output(state, args.job_id)
     else:
         result = asyncio.run(print_job(state, args.job_id, args.confirm))
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("ok") is False:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     try:
         main()
+    except PrinterFault as error:
+        print(json.dumps(error.as_result(), ensure_ascii=False, indent=2))
+        sys.exit(1)
     except (Exception, KeyboardInterrupt) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print(json.dumps(normalize_error(error, output_uncertain=isinstance(error, KeyboardInterrupt)).as_result(),
+                         ensure_ascii=False, indent=2))
         sys.exit(1)

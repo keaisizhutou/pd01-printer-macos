@@ -11,6 +11,8 @@ import secrets
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from printer_faults import fault
 
 TIMEOUT_SECONDS = 120
 SOURCE = Path(__file__).parent / "native" / "PrintConfirmation.swift"
@@ -18,7 +20,7 @@ SOURCE = Path(__file__).parent / "native" / "PrintConfirmation.swift"
 
 def build_helper() -> Path:
     if sys.platform != "darwin":
-        raise RuntimeError("Native confirmation requires a logged-in macOS desktop")
+        raise fault("confirmation_unavailable", phase="confirmation")
     digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()[:20]
     cache = Path.home() / "Library" / "Caches" / "pd01-printer-macos"
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -34,29 +36,43 @@ def build_helper() -> Path:
             capture_output=True, timeout=180,
         )
         if result.returncode:
-            raise RuntimeError("Cannot build confirmation window. Install Apple Command Line Tools (xcode-select --install).")
+            raise fault("confirmation_build_failed", phase="confirmation")
         os.chmod(temporary, 0o700)
         os.replace(temporary, binary)
         return binary
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Confirmation window build timed out; run setup-confirmation before printing.") from error
+        raise fault("confirmation_build_timeout", phase="confirmation") from error
     finally:
         Path(temporary).unlink(missing_ok=True)
 
 
-def response_approved(output: bytes, returncode: int, request: dict) -> bool:
+@dataclass(frozen=True)
+class ConfirmationDecision:
+    approved: bool
+    reason: str
+
+    def __bool__(self):
+        return self.approved
+
+
+def parse_decision(output: bytes, returncode: int, request: dict) -> ConfirmationDecision:
     if returncode != 0:
-        return False
+        raise fault("confirmation_window_failed", phase="confirmation")
     try:
         result = json.loads(output)
     except (ValueError, UnicodeError):
-        return False
-    return (isinstance(result, dict) and result.get("approved") is True
-            and all(result.get(key) == request[key]
-                    for key in ("job_id", "nonce", "sha256", "purpose")))
+        raise fault("confirmation_response_invalid", phase="confirmation") from None
+    if not isinstance(result, dict) or any(result.get(key) != request[key]
+                                          for key in ("job_id", "nonce", "sha256", "purpose")):
+        raise fault("confirmation_response_invalid", phase="confirmation")
+    if result.get("approved") is True and result.get("reason") == "approved":
+        return ConfirmationDecision(True, "approved")
+    if result.get("approved") is False and result.get("reason") in ("cancelled", "window_closed"):
+        return ConfirmationDecision(False, result["reason"])
+    raise fault("confirmation_response_invalid", phase="confirmation")
 
 
-async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False) -> bool:
+async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False) -> ConfirmationDecision:
     """Show exact in-memory pixels. No CLI/MCP option can silently approve this window."""
     binary = await asyncio.to_thread(build_helper)
     request = {
@@ -69,15 +85,18 @@ async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False
     }
     # Swift uses camelCase for the one field; the response uses the job-store spelling.
     payload = {**request, "jobID": request["job_id"]}
-    process = await asyncio.create_subprocess_exec(
-        str(binary), stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(binary), stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise fault("confirmation_window_failed", phase="confirmation") from error
     try:
         output, _ = await asyncio.wait_for(
             process.communicate(json.dumps(payload).encode("utf-8")), TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
-        return False
+        raise fault("confirmation_timeout", phase="confirmation") from None
     finally:
         if process.returncode is None:
             try:
@@ -85,4 +104,4 @@ async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False
             except ProcessLookupError:
                 pass
             await process.wait()
-    return response_approved(output, process.returncode, request)
+    return parse_decision(output, process.returncode, request)
