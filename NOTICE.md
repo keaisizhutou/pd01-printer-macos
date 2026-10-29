@@ -15,4 +15,6 @@ Reported blank-output troubleshooting is available through CLI and MCP. It inspe
 
 CLI and MCP now share explicit printer selection and a per-user OS file-lock queue across processes and state directories. Bluetooth stages and complete operations have deadlines, with bounded cleanup and no automatic replay. The local confirmation response is also bound to the selected printer, so later configuration changes cannot redirect an approved job.
 
+Installation guidance for local AI agents, hash-locked dependencies, a read-only service identity endpoint, and actual local HTTP installation tests are included for reproducible setup. Service identity does not diagnose a printer or authorize printing.
+
 Upstream credits [rhnvrm/catprinter](https://github.com/rhnvrm/catprinter) (MIT) for public reverse-engineering work on command framing and GATT details. The original copyright and MIT license are retained in LICENSE.

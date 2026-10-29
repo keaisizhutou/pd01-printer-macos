@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import secrets
 import subprocess
 import sys
@@ -18,13 +19,18 @@ TIMEOUT_SECONDS = 120
 SOURCE = Path(__file__).parent / "native" / "PrintConfirmation.swift"
 
 
+def helper_path() -> Path:
+    digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()[:20]
+    return (Path.home() / "Library" / "Caches" / "pd01-printer-macos" /
+            f"confirm-{digest}-{platform.machine()}")
+
+
 def build_helper() -> Path:
     if sys.platform != "darwin":
         raise fault("confirmation_unavailable", phase="confirmation")
-    digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()[:20]
-    cache = Path.home() / "Library" / "Caches" / "pd01-printer-macos"
+    binary = helper_path()
+    cache = binary.parent
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-    binary = cache / f"confirm-{digest}"
     if binary.is_file():
         return binary
     descriptor, temporary = tempfile.mkstemp(dir=cache, prefix=".confirm-")

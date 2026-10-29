@@ -4,16 +4,27 @@
 
 基于 [1124823599331l-boop/pd01-printer-mcp](https://github.com/1124823599331l-boop/pd01-printer-mcp) 的 Mac 适配，沿用原项目的蓝牙、打印协议和排版代码，并非从零重写驱动。原作者署名与 MIT 许可证见 [NOTICE.md](NOTICE.md) 和 [LICENSE](LICENSE)。
 
+## 把链接交给 AI 安装
+
+把本仓库地址发给能操作你这台 Mac 终端的 AI，并告诉它：
+
+> 请先阅读 README 和 INSTALL.md，按清单在我的 Mac 上安装、启动并完成不出纸验收。你能执行的命令请自己完成；需要系统授权或我操作打印机时再说明。先不要打印。
+
+[INSTALL.md](INSTALL.md) 是 AI 的执行清单，包含环境检查、隔离安装、服务身份核对、真实 MCP 调用及首次选机。安装和打印连接分别验收。每个人使用自己的设备选择、校准和任务目录，仓库不附带作者的打印机配置。私有仓库需要先具备访问权限。
+
 ## 安装
 
 需要带蓝牙且已登录桌面的 Mac、Python 3.12、Apple Command Line Tools（含 Swift 编译器）、兼容原项目 0x5178 协议的 PD01，以及 58mm 热敏纸。缺少编译器时先手动运行 `xcode-select --install`。
+
+M 系列应使用原生 `arm64` Python。Intel 的部分依赖可能需要源码编译，额外构建前提见 [INSTALL.md](INSTALL.md#intel-与-m-系列)；不要把本机已有的工具当作所有朋友机器的默认条件。
 
 ```bash
 git clone https://github.com/keaisizhutou/pd01-printer-macos.git
 cd pd01-printer-macos
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
+python -m pip check
 python pd01_mac.py setup-confirmation
 ```
 
@@ -189,6 +200,8 @@ python printer_server.py
 - `print_prepared`：传入任务 ID 和 `CONFIRM_PRINT` 后打开本机确认窗口，点击「确认打印 1 张」才尝试发送。
 - `disconnect_printer`：断开连接。
 
+安装验收还可读取 `http://127.0.0.1:4176/health`。它只返回运行进程的服务、源码、数据目录、代码和 Python 环境指纹，用于识别端口上的服务是否属于本次安装；不返回原始路径、设备编号或打印内容，也不检查打印机。核对方式见 INSTALL，不能用 HTTP 正常代替实际 MCP 调用与实物验收。
+
 Mac 字体自动尝试系统黑体等中文字体；也可设置 `PD01_FONT_PATH` 为现有 TTF/TTC 字体路径。服务默认只监听本机；远程访问必须另外配置身份验证和安全网络入口。
 
 AI 客户端应展示返回的图片和完整原文，再向用户取得明确批准。图片内容与保存的打印任务一致；发送前会校验图片摘要。`prepare_text` 的结构化结果仍含任务 ID、原文、字号、对齐和图片尺寸；图片作为额外的 MCP 内容块返回，能否直接显示取决于客户端。
@@ -214,3 +227,21 @@ python -m unittest discover -s tests -v
 ```
 
 项目不附带个人设备标识、打印内容、预览图片、日志或访问凭证。
+
+## 维护与依赖更新
+
+`requirements.txt` 是三个直接依赖的维护输入，`requirements.lock` 锁定完整依赖及分发包哈希。普通安装使用后者。修改依赖后，维护者可以用 uv 重新解析，并更新输入摘要：
+
+```bash
+uv pip compile requirements.txt --python-version 3.12 --universal --generate-hashes --no-annotate --no-header -o requirements.lock
+python3.12 - <<'PY'
+import hashlib
+from pathlib import Path
+path = Path('requirements.lock')
+body = '\n'.join(line for line in path.read_text().splitlines() if not line.startswith('# source-sha256:'))
+digest = hashlib.sha256(Path('requirements.txt').read_bytes()).hexdigest()
+path.write_text('# source-sha256: ' + digest + '\n' + body + '\n')
+PY
+```
+
+依赖升级需重新在空虚拟环境安装、执行 `pip check`、构建确认窗口并运行全部测试。GitHub Actions 使用 Mac 环境执行相同流程；测试禁止真实蓝牙和真实打印，不能代替其他 Mac、固件及实物的兼容性验证。

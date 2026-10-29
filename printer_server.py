@@ -17,6 +17,7 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image as MCPImage
 from PIL import Image, ImageDraw, ImageFont
 from mcp.types import TextContent
+from starlette.responses import JSONResponse
 
 import job_store
 import printer_devices
@@ -24,6 +25,7 @@ import printer_runtime as runtime
 from printer_faults import PrinterFault, fault, normalize_error, interpret_status, load_profile, raise_for_faults
 from print_layout import PAPER_WIDTH, check_height, image_raster, png_bytes, mixed_raster
 from printer_telemetry import read_battery
+from server_info import service_identity
 
 if os.name == "nt":
     from winrt.windows.devices.bluetooth import BluetoothCacheMode, BluetoothLEDevice
@@ -62,8 +64,15 @@ FONT_CANDIDATES = (
 )
 
 mcp = FastMCP("pd01-printer")
+_SERVER_IDENTITY = service_identity(Path(__file__).resolve().parent, job_store.default_state())
 current_client: Any | None = None
 print_lock = asyncio.Lock()
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def service_health(_request):
+    """Identity of this running process. Does not connect to Bluetooth or certify paper output."""
+    return JSONResponse(_SERVER_IDENTITY)
 
 
 def crc8(data: bytes) -> int:

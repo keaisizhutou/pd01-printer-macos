@@ -1,0 +1,53 @@
+name: macOS installation and validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            python-arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            python-arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.python-arch }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Verify native interpreter architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: python -c "import os, platform; assert platform.machine() == os.environ['EXPECTED_ARCH']; print(platform.machine())"
+      - name: Prepare Intel source-build prerequisites
+        if: matrix.arch == 'x86_64'
+        run: |
+          brew install openssl@3 rust
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+      - name: Install locked dependencies in an isolated environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --require-hashes -r requirements.lock
+          .venv/bin/python -m pip check
+      - name: Build confirmation helper without opening a window
+        run: .venv/bin/python pd01_mac.py setup-confirmation
+      - name: Test without real Bluetooth or printing
+        run: .venv/bin/python -m unittest discover -s tests -v
