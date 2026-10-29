@@ -54,7 +54,7 @@ def job_folder(state: Path, job_id: str) -> Path:
 
 
 def create(state: Path, text: str, png: bytes, width: int, height: int,
-           lines: int, font_size: int, align: str) -> dict:
+           lines: int, font_size: int | None, align: str, *, kind: str = "text") -> dict:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     job_id = secrets.token_hex(8)
     folder = state / "jobs" / job_id
@@ -66,7 +66,7 @@ def create(state: Path, text: str, png: bytes, width: int, height: int,
         output.flush()
         os.fsync(output.fileno())
     data = {
-        "job_id": job_id, "text": text, "font_size": font_size, "align": align,
+        "job_id": job_id, "text": text, "font_size": font_size, "align": align, "kind": kind,
         "width": width, "height": height, "lines": lines,
         "sha256": hashlib.sha256(png).hexdigest(),
     }

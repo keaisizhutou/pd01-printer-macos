@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import io
 import os
 from pathlib import Path
 import sys
 
 import printer_server as driver
 import job_store
+from PIL import Image
 
 DEFAULT_STATE = job_store.default_state()
 
@@ -17,6 +19,22 @@ DEFAULT_STATE = job_store.default_state()
 def prepare(state: Path, text: str, font_size: int = 36, align: str = "center") -> dict:
     png, width, height, lines = driver.render_text(text, font_size, align)
     return job_store.create(state, text, png, width, height, lines, font_size, align)
+
+
+def prepare_image(state: Path, source_path: Path) -> dict:
+    """Rasterize an image to the printer width; preview and sent pixels remain identical."""
+    with Image.open(source_path) as source:
+        rgba = source.convert("RGBA")
+    white = Image.new("RGBA", rgba.size, "white")
+    white.alpha_composite(rgba)
+    gray = white.convert("L")
+    height = max(1, round(gray.height * driver.PAPER_WIDTH / gray.width))
+    gray = gray.resize((driver.PAPER_WIDTH, height), Image.Resampling.LANCZOS)
+    raster = gray.point(lambda value: 0 if value < 160 else 255, mode="1")
+    output = io.BytesIO()
+    raster.save(output, format="PNG")
+    return job_store.create(state, "图片打印", output.getvalue(), raster.width,
+                            raster.height, 0, None, "center", kind="image")
 
 
 async def check(state: Path) -> dict:
@@ -61,6 +79,8 @@ def main() -> None:
     prep.add_argument("--text-file", type=Path, required=True)
     prep.add_argument("--font-size", type=int, default=36)
     prep.add_argument("--align", choices=("left", "center", "right"), default="center")
+    image_prep = actions.add_parser("prepare-image", help="Prepare a black-and-white image preview without printing")
+    image_prep.add_argument("--image-file", type=Path, required=True)
     printing = actions.add_parser("print", help="Open a native confirmation window, then print once if approved")
     printing.add_argument("job_id")
     printing.add_argument("--confirm", required=True)
@@ -81,6 +101,8 @@ def main() -> None:
         result = {'demo': True, 'button_confirmed': approved, 'paper_used': False}
     elif args.action == "prepare":
         result = prepare(state, args.text_file.read_text(encoding="utf-8"), args.font_size, args.align)
+    elif args.action == "prepare-image":
+        result = prepare_image(state, args.image_file)
     else:
         result = asyncio.run(print_job(state, args.job_id, args.confirm))
     print(json.dumps(result, ensure_ascii=False, indent=2))

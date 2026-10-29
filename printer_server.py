@@ -42,6 +42,10 @@ MAX_TEXT_LENGTH = 2_000
 
 SERVICE_UUID = "0000ae30-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR_UUID = "0000ae01-0000-1000-8000-00805f9b34fb"
+NOTIFY_CHAR_UUID = "0000ae02-0000-1000-8000-00805f9b34fb"
+CHUNK_DELAY_SECONDS = 0.02
+TAIL_DRAIN_SECONDS = 2.0
+STATUS_TIMEOUT_SECONDS = 3.0
 
 FONT_CANDIDATES = (
     os.getenv("PD01_FONT_PATH", ""),
@@ -70,6 +74,48 @@ def crc8(data: bytes) -> int:
 def command(code: int, payload: bytes = b"") -> bytes:
     length = len(payload).to_bytes(2, "little")
     return bytes((0x51, 0x78, code, 0x00)) + length + payload + bytes((crc8(payload), 0xFF))
+
+
+class PrinterFeedback:
+    """Parse fragmented/combined notifications without claiming physical paper output."""
+    def __init__(self):
+        self.buffer = bytearray()
+        self.state_received = asyncio.Event()
+        self.state_replies = 0
+        self.commands = set()
+        self.ready_reported = False
+
+    def receive(self, _characteristic, data):
+        self.buffer.extend(data)
+        while len(self.buffer) >= 8:
+            start = self.buffer.find(b"\x51\x78")
+            if start < 0:
+                self.buffer[:] = self.buffer[-1:] if self.buffer[-1:] == b"\x51" else b""
+                return
+            del self.buffer[:start]
+            if len(self.buffer) < 8:
+                return
+            length = int.from_bytes(self.buffer[4:6], "little")
+            if length > 1024:
+                del self.buffer[0]
+                continue
+            size = 8 + length
+            if len(self.buffer) < size:
+                return
+            frame = bytes(self.buffer[:size])
+            payload = frame[6:-2]
+            if frame[-1] != 0xFF or crc8(payload) != frame[-2]:
+                del self.buffer[0]
+                continue
+            del self.buffer[:size]
+            if frame[3] != 1:
+                continue
+            self.commands.add(frame[2])
+            if frame[2] == 0xA3:
+                self.state_replies += 1
+                self.state_received.set()
+            elif frame[2] == 0xAE and payload == b"\x00":
+                self.ready_reported = True
 
 
 STATE_QUERY = command(0xA3, b"\x00")
@@ -382,9 +428,12 @@ async def ensure_connected() -> Any:
     return current_client
 
 
-async def print_png(png_data: bytes, device_address: str | None = None) -> dict[str, int | bool]:
+async def print_png(png_data: bytes, device_address: str | None = None) -> dict[str, Any]:
     global current_client, DEVICE_ADDRESS
     rows = png_to_rows(png_data)
+    feedback = PrinterFeedback()
+    listening = False
+    post_send_reply = False
     async with print_lock:
         try:
             if device_address is not None and device_address != DEVICE_ADDRESS:
@@ -393,6 +442,15 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
                     current_client = None
                 DEVICE_ADDRESS = device_address
             client = await ensure_connected()
+            if hasattr(client, "start_notify"):
+                await client.start_notify(NOTIFY_CHAR_UUID, feedback.receive)
+                listening = True
+                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
+                try:
+                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Printer did not answer the preflight status query; no image data was sent") from None
+                feedback.state_received.clear()
             data = bytearray()
             data.extend(STATE_QUERY)
             data.extend(QUALITY_200_DPI)
@@ -411,10 +469,25 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
                     data[offset : offset + 123],
                     response=False,
                 )
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(CHUNK_DELAY_SECONDS)
+            # Writes without response only enqueue data. Keep BLE open while the tail drains.
+            await asyncio.sleep(TAIL_DRAIN_SECONDS)
+            if listening:
+                feedback.state_received.clear()
+                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
+                try:
+                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                    post_send_reply = True
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Image bytes were queued but the printer stopped replying. Output is uncertain; inspect the paper before any retry") from None
         finally:
             # Finish cleanup while holding the same lock as checks and disconnects.
             if current_client is not None:
+                if listening:
+                    try:
+                        await current_client.stop_notify(NOTIFY_CHAR_UUID)
+                    except Exception:
+                        pass
                 try:
                     await current_client.disconnect()
                 except Exception:
@@ -423,7 +496,10 @@ async def print_png(png_data: bytes, device_address: str | None = None) -> dict[
                     current_client = None
 
     return {"data_sent": True, "physical_output_verified": False,
-            "rows": len(rows), "bytes_sent": len(data)}
+            "rows": len(rows), "bytes_sent": len(data),
+            "device_reply_after_send": post_send_reply,
+            "device_ready_reported": feedback.ready_reported,
+            "feedback_commands": [f"{code:02x}" for code in sorted(feedback.commands)]}
 
 
 async def send_stored_png(state: Path, png_data: bytes) -> dict:

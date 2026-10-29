@@ -65,6 +65,7 @@ async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False
         "purpose": "demo" if demo else "print",
         "image": base64.b64encode(png).decode("ascii"),
         "fontSize": metadata["font_size"], "align": metadata["align"],
+        "kind": metadata.get("kind", "text"),
     }
     # Swift uses camelCase for the one field; the response uses the job-store spelling.
     payload = {**request, "jobID": request["job_id"]}

@@ -6,7 +6,8 @@ struct Request: Decodable {
     let nonce: String
     let sha256: String
     let image: String
-    let fontSize: Int
+    let fontSize: Int?
+    let kind: String?
     let align: String
     let purpose: String
 }
@@ -49,7 +50,8 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
             : "请核对下面的实际预览。点击确认后，将向打印机发送 1 张。")
         subtitle.textColor = .secondaryLabelColor
         let alignment = ["left": "左对齐", "center": "居中", "right": "右对齐"][request.align] ?? request.align
-        let details = NSTextField(labelWithString: "字号 \(request.fontSize)  ·  \(alignment)  ·  1 张")
+        let summary = request.kind == "image" ? "黑白图片  ·  1 张" : "字号 \(request.fontSize ?? 36)  ·  \(alignment)  ·  1 张"
+        let details = NSTextField(labelWithString: summary)
         details.font = .systemFont(ofSize: 13, weight: .medium)
 
         let scroll = NSScrollView()
