@@ -10,6 +10,8 @@ struct Request: Decodable {
     let kind: String?
     let align: String
     let purpose: String
+    let printerID: String?
+    let printerName: String?
 }
 
 final class PreviewCanvas: NSView {
@@ -51,7 +53,7 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
         subtitle.textColor = .secondaryLabelColor
         let alignment = ["left": "左对齐", "center": "居中", "right": "右对齐"][request.align] ?? request.align
         let summary = request.kind == "image" ? "黑白图片  ·  1 张" : request.kind == "mixed" ? "图文混排  ·  1 张" : "字号 \(request.fontSize ?? 36)  ·  \(alignment)  ·  1 张"
-        let details = NSTextField(labelWithString: summary)
+        let details = NSTextField(wrappingLabelWithString: summary + (request.printerName.map { "\n打印机：" + $0 } ?? ""))
         details.font = .systemFont(ofSize: 13, weight: .medium)
 
         let scroll = NSScrollView()
@@ -97,6 +99,7 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -24),
             subtitle.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            details.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 350),
             note.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -117,11 +120,12 @@ final class ConfirmationController: NSObject, NSWindowDelegate {
         guard !finished else { return }
         finished = true
         confirmButton.isEnabled = false
-        let response: [String: Any] = [
+        var response: [String: Any] = [
             "approved": approved, "job_id": request.jobID,
             "nonce": request.nonce, "sha256": request.sha256, "purpose": request.purpose,
             "reason": reason
         ]
+        if let printerID = request.printerID { response["printer_id"] = printerID }
         if let data = try? JSONSerialization.data(withJSONObject: response) {
             FileHandle.standardOutput.write(data)
         }

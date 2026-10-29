@@ -58,11 +58,14 @@ class PrinterFault(RuntimeError):
         self.output_uncertain = output_uncertain
 
     def as_result(self) -> dict:
-        return {"ok": False, "status": "output_uncertain" if self.output_uncertain else "blocked",
+        result = {"ok": False, "status": "output_uncertain" if self.output_uncertain else "blocked",
                 "error_code": self.code, "message": self.message, "action": self.action,
                 "phase": self.phase, "data_sent": None if self.output_uncertain else False,
                 "paper_used": None if self.output_uncertain else False,
                 "physical_output_verified": False, "automatic_retry": False}
+        if getattr(self, "cleanup_errors", None):
+            result["cleanup_errors"] = self.cleanup_errors
+        return result
 
 
 def fault(code: str, *, phase: str = "preparation", output_uncertain: bool = False) -> PrinterFault:

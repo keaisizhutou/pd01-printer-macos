@@ -124,11 +124,12 @@ def read_status(state: Path, job_id: str) -> dict:
         raise fault("job_corrupt") from None
     phase = result.get("status")
     messages = {"waiting_confirmation": "最近记录：等待本机窗口按钮确认", "checking_printer": "最近记录：检查打印机状态",
+                "selecting_printer": "正在选择打印机", "waiting_for_printer": "正在等待其他蓝牙操作结束",
                 "sending": "最近记录：发送打印数据", "awaiting_device_reply": "最近记录：已发送，等待设备回复",
                 "sent": "数据已发送，实物出纸仍需确认", "cancelled_before_send": "本次已取消，未发送",
                 "blocked_before_send": "检测到问题，已阻止发送", "uncertain_do_not_retry": "出纸结果不确定，不能自动重打",
                 "confirmation_failed_before_send": "确认阶段失败，未发送", "started_outcome_unknown": "上次操作结果未知，不能自动重打"}
-    sent = True if phase == "sent" else False if phase in ("waiting_confirmation", "checking_printer",
+    sent = True if phase == "sent" else False if phase in ("waiting_confirmation", "checking_printer", "selecting_printer", "waiting_for_printer",
         "cancelled_before_send", "blocked_before_send", "confirmation_failed_before_send") else None
     response = {"job_id": job_id, **result, "message": result.get("error", {}).get("message", messages.get(phase, "任务状态未知")),
                 "data_sent": sent, "physical_output_verified": False, "status_source": "local_record",
@@ -159,7 +160,7 @@ def report_blank_output(state: Path, job_id: str) -> dict:
     return report
 
 
-async def dispatch(state: Path, job_id: str, confirmation: str, sender) -> dict:
+async def dispatch(state: Path, job_id: str, confirmation: str, sender, *, resolve_target=None) -> dict:
     if confirmation != CONFIRMATION_TOKEN:
         raise fault("confirmation_required", phase="confirmation")
     metadata, png = load(state, job_id)
@@ -181,37 +182,49 @@ async def dispatch(state: Path, job_id: str, confirmation: str, sender) -> dict:
     except OSError as error:
         raise normalize_error(error, phase="confirmation") from error
     sending_started = False
-    progress_token = _progress_callback.set(lambda phase: save_json(attempt, {"status": phase}))
+    target_fields = {}
+    last_phase = "waiting_confirmation"
+    def persist_progress(phase):
+        nonlocal last_phase
+        save_json(attempt, {"status": phase, **target_fields})
+        last_phase = phase
+    progress_token = _progress_callback.set(persist_progress)
     try:
+        if resolve_target is not None:
+            report_progress("selecting_printer")
+            target = await resolve_target()
+            target_fields.update(printer_id=target["id"], printer_name=target["name"] + " · " + target["id"][-6:])
+            metadata = {**metadata, **target_fields}
+            report_progress("waiting_confirmation")
         decision = await request_confirmation(metadata, png)
         if not decision:
             reason = getattr(decision, "reason", "cancelled")
-            save_json(attempt, {"status": "cancelled_before_send", "reason": reason, "data_sent": False})
+            save_json(attempt, {"status": "cancelled_before_send", "reason": reason, "data_sent": False, **target_fields})
             return {"job_id": job_id, "data_sent": False, "cancelled": True, "reason": reason,
-                    "paper_used": False, "physical_output_verified": False}
+                    "paper_used": False, "physical_output_verified": False, **target_fields}
         report_progress("checking_printer")
         sending_started = True
         result = await sender(png)
-        save_json(attempt, {"status": "sent", "result": result})
+        save_json(attempt, {"status": "sent", "result": result, **target_fields})
         return {"job_id": job_id, "data_sent": True,
-                "physical_output_verified": False, "driver_result": result,
+                "physical_output_verified": False, "driver_result": result, **target_fields,
                 "next_step": "请核对实物；若走纸但空白，可用 report_blank_output 获取排查建议。不要自动重打。"}
     except BaseException as error:
         # If saving also fails, the durable initial claim still blocks any later attempt.
+        uncertain = sending_started and last_phase != "waiting_for_printer"
+        phase = "queue" if last_phase == "waiting_for_printer" else "sending" if sending_started else "confirmation"
         try:
             if isinstance(error, PrinterFault):
                 save_json(attempt, {"status": "uncertain_do_not_retry" if error.output_uncertain
-                                   else "blocked_before_send", "error": error.as_result()})
+                                   else "blocked_before_send", "error": error.as_result(), **target_fields})
             else:
-                normalized = normalize_error(error, phase="sending" if sending_started else "confirmation",
-                                             output_uncertain=sending_started)
-                save_json(attempt, {"status": "uncertain_do_not_retry" if sending_started
-                                   else "confirmation_failed_before_send", "error": normalized.as_result()})
+                normalized = normalize_error(error, phase=phase, output_uncertain=uncertain)
+                status = "uncertain_do_not_retry" if uncertain else "cancelled_before_send" if isinstance(error, asyncio.CancelledError) else "confirmation_failed_before_send"
+                save_json(attempt, {"status": status, "error": normalized.as_result(), **target_fields})
         except OSError:
             pass
         if isinstance(error, (PrinterFault, asyncio.CancelledError)):
             raise
-        raise normalize_error(error, phase="sending" if sending_started else "confirmation",
-                              output_uncertain=sending_started) from error
+        raise normalize_error(error, phase=phase, output_uncertain=uncertain) from error
     finally:
         _progress_callback.reset(progress_token)

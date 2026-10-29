@@ -19,6 +19,8 @@ from PIL import Image, ImageDraw, ImageFont
 from mcp.types import TextContent
 
 import job_store
+import printer_devices
+import printer_runtime as runtime
 from printer_faults import PrinterFault, fault, normalize_error, interpret_status, load_profile, raise_for_faults
 from print_layout import PAPER_WIDTH, check_height, image_raster, png_bytes, mixed_raster
 from printer_telemetry import read_battery
@@ -387,50 +389,32 @@ class WindowsPairedGattClient:
 
 
 async def connect_device() -> Any:
-    errors: list[str] = []
-
-    if os.name == "nt":
-        try:
-            client = WindowsPairedGattClient(DEVICE_NAME, DEVICE_ADDRESS)
-            await client.connect()
-            return client
-        except Exception as error:
-            errors.append(f"Windows paired-device path: {error}")
-
+    address = DEVICE_ADDRESS
+    if not address:
+        address = (await printer_devices.resolve(job_store.default_state(), DEVICE_NAME))["id"]
+    client = None
     try:
-        if DEVICE_ADDRESS:
-            device = await BleakScanner.find_device_by_address(DEVICE_ADDRESS, timeout=8.0)
-        else:
-            device = await BleakScanner.find_device_by_filter(
-                lambda candidate, _: candidate.name == DEVICE_NAME,
-                timeout=8.0,
-            )
+        device = await runtime.bounded(
+            BleakScanner.find_device_by_address(address, timeout=8), runtime.SCAN_TIMEOUT_SECONDS,
+            "printer_scan_timeout", "查找已选择的打印机超时")
         if device is None:
-            errors.append("BLE scan did not find the configured printer")
-        else:
-            address_types = ("random", "public") if os.name == "nt" else (None,)
-            for address_type in address_types:
-                kwargs: dict[str, Any] = {"timeout": 20.0}
-                if address_type is not None:
-                    kwargs["winrt"] = {
-                        "address_type": address_type,
-                        "use_cached_services": True,
-                    }
-                client = BleakClient(device, **kwargs)
-                try:
-                    await client.connect()
-                    return client
-                except Exception as error:
-                    errors.append(f"BLE {address_type or 'default'}: {error}")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-    except Exception as error:
-        errors.append(f"BLE scan: {error}")
-
-    raise PrinterFault("printer_unavailable", "无法发现或连接打印机",
-                       "确认打印机开机并靠近 Mac，关闭占用它的手机打印 App，再检查蓝牙权限。")
+            raise PrinterFault("printer_unavailable", "没有发现已选择的打印机",
+                               "唤醒已选择的设备；程序不会改连另一台同名打印机。")
+        client = BleakClient(device, timeout=runtime.CONNECT_TIMEOUT_SECONDS)
+        await runtime.bounded(client.connect(), runtime.CONNECT_TIMEOUT_SECONDS,
+                              "printer_connect_timeout", "连接打印机超时")
+        return client
+    except BaseException as error:
+        if client is not None:
+            try:
+                await runtime.bounded(client.disconnect(), runtime.CLEANUP_TIMEOUT_SECONDS,
+                                      "printer_disconnect_timeout", "断开未完成的连接超时", phase="cleanup")
+            except Exception:
+                pass
+        if isinstance(error, (PrinterFault, asyncio.CancelledError)):
+            raise
+        raise PrinterFault("printer_unavailable", "无法发现或连接打印机",
+                           "确认打印机开机并靠近 Mac，关闭占用它的手机打印 App，再检查蓝牙权限。") from error
 
 
 async def ensure_connected() -> Any:
@@ -442,75 +426,150 @@ async def ensure_connected() -> Any:
 
 
 def configured_address(state: Path) -> str | None:
-    address = os.getenv("PD01_DEVICE_ADDRESS", "").strip() or None
-    cached = state / "device.json"
-    if address is None and cached.exists():
-        address = json.loads(cached.read_text(encoding="utf-8"))["id"]
-    return address
+    target = printer_devices.configured_target(state)
+    return target["id"] if target else None
 
 
-async def diagnose_printer(state: Path, samples: int = 1) -> dict:
+async def list_available_printers(state: Path) -> dict:
+    async with runtime.hardware_queue(print_lock):
+        targets = await printer_devices.discover(DEVICE_NAME)
+        try:
+            target = printer_devices.configured_target(state)
+        except PrinterFault:
+            target = None
+        selected = target["id"] if target else None
+        return {"printers": [{**item, "selected": item["id"] == selected} for item in targets],
+                "selected_printer": target,
+                "paper_used": False}
+
+
+async def select_target(state: Path, device_id: str) -> dict:
+    async with runtime.hardware_queue(print_lock):
+        target = await printer_devices.select(state, DEVICE_NAME, device_id)
+        return {"selected_printer": target, "paper_used": False,
+                "message": "已选择打印机；已打开的确认窗口仍绑定其原目标。"}
+
+
+async def resolve_print_target(state: Path) -> dict:
+    selected = printer_devices.configured_target(state)
+    if selected:
+        return selected
+    job_store.report_progress("waiting_for_printer")
+    async with runtime.hardware_queue(print_lock):
+        return await printer_devices.resolve(state, DEVICE_NAME)
+
+
+async def _cleanup(listening: bool, failure: BaseException | None, uncertain: bool) -> None:
+    global current_client
+    client = current_client
+    errors = []
+    try:
+        if client is not None:
+            operations = [("stop_notify", lambda: client.stop_notify(NOTIFY_CHAR_UUID))] if listening else []
+            operations.append(("disconnect", client.disconnect))
+            for name, operation in operations:
+                try:
+                    await runtime.bounded(operation(), runtime.CLEANUP_TIMEOUT_SECONDS,
+                                          "printer_cleanup_timeout", "蓝牙连接清理超时",
+                                          phase="cleanup", output_uncertain=uncertain)
+                except Exception:
+                    errors.append(name)
+    finally:
+        current_client = None
+    if errors:
+        if isinstance(failure, PrinterFault):
+            failure.cleanup_errors = errors
+        elif failure is None:
+            raise PrinterFault("printer_cleanup_failed", "蓝牙连接清理未完成",
+                               "先检查实物并重启打印机，暂勿重打已尝试过的任务。",
+                               phase="cleanup", output_uncertain=uncertain)
+
+
+async def _write(client, data: bytes, *, uncertain: bool = False, phase: str = "preflight") -> None:
+    await runtime.bounded(client.write_gatt_char(WRITE_CHAR_UUID, data, response=False),
+                          runtime.WRITE_TIMEOUT_SECONDS, "printer_write_timeout", "蓝牙写入超时",
+                          phase=phase, output_uncertain=uncertain)
+
+
+def _check_channel(client) -> None:
+    char = client.services.get_characteristic(WRITE_CHAR_UUID)
+    if char is None or "write-without-response" not in char.properties:
+        raise PrinterFault("write_channel_unavailable", "设备没有提供兼容的打印通道",
+                           "确认设备型号与本项目兼容，不要向未识别通道发送打印指令。")
+    if char.max_write_without_response_size < 123:
+        raise PrinterFault("write_chunk_unsupported", "设备的蓝牙写入容量不满足当前驱动要求",
+                           "暂时停止发送，需要适配该设备的分包大小。")
+
+
+async def diagnose_printer(state: Path, samples: int = 1, *, check_channel: bool = False) -> dict:
     """Read A3 status only. No image, feed, energy or print commands are sent."""
     global current_client, DEVICE_ADDRESS
     if not 1 <= samples <= 10:
         raise ValueError("samples must be between 1 and 10")
-    address = configured_address(state)
-    profile = load_profile(state, address)
     feedback = PrinterFeedback()
     listening = False
-    async with print_lock:
+    failure = None
+    job_store.report_progress("waiting_for_printer")
+    async with runtime.hardware_queue(print_lock):
         try:
-            if address is not None and address != DEVICE_ADDRESS:
-                if current_client is not None:
-                    await current_client.disconnect()
-                    current_client = None
-                DEVICE_ADDRESS = address
-            client = await ensure_connected()
-            if not hasattr(client, "start_notify"):
-                raise PrinterFault("status_unsupported", "当前连接方式不支持读取设备状态",
-                                   "请使用支持通知的 Mac 蓝牙连接；目前不能判断纸张或纸仓状态。")
-            await client.start_notify(NOTIFY_CHAR_UUID, feedback.receive)
-            listening = True
-            payloads = []
-            for _ in range(samples):
-                feedback.state_received.clear()
-                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
-                try:
-                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
-                    raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态",
-                                       "检查设备是否休眠或被其他 App 占用；当前不能判定纸张状态。") from None
-                payloads.append(feedback.state_payloads[-1])
-                if len(payloads) < samples:
-                    await asyncio.sleep(0.3)
-            status = interpret_status(payloads[-1], profile)
-            calibration_unavailable = (state / "status-profile.json").exists() and profile is None
-            if calibration_unavailable:
-                status["summary"] = "已配置的故障检查规则不可用，打印将被阻止；请重新校准"
-            return {"reachable": True, "paper_used": False,
-                    "status_samples": [payload.hex() for payload in payloads], **status,
-                    "ok": not status["faults"] and not calibration_unavailable,
-                    "calibration_available": profile is not None,
-                    "calibration_required": calibration_unavailable,
-                    "battery": await read_battery(client)}
-        except PrinterFault:
+            async with asyncio.timeout(runtime.DIAGNOSTIC_TIMEOUT_SECONDS):
+                address = configured_address(state)
+                if address is None:
+                    address = (await printer_devices.resolve(state, DEVICE_NAME))["id"]
+                profile = load_profile(state, address)
+                if address != DEVICE_ADDRESS:
+                    if current_client is not None:
+                        await runtime.bounded(current_client.disconnect(), runtime.CLEANUP_TIMEOUT_SECONDS, "printer_disconnect_timeout", "切换设备时断开连接超时", phase="cleanup")
+                        current_client = None
+                    DEVICE_ADDRESS = address
+                client = await runtime.bounded(ensure_connected(), runtime.CONNECT_TIMEOUT_SECONDS + runtime.SCAN_TIMEOUT_SECONDS, "printer_connect_timeout", "查找或连接打印机超时")
+                if check_channel:
+                    _check_channel(client)
+                if not hasattr(client, "start_notify"):
+                    raise PrinterFault("status_unsupported", "当前连接方式不支持读取设备状态",
+                                       "请使用支持通知的 Mac 蓝牙连接；目前不能判断纸张或纸仓状态。")
+                await runtime.bounded(client.start_notify(NOTIFY_CHAR_UUID, feedback.receive), runtime.NOTIFY_TIMEOUT_SECONDS, "printer_notify_timeout", "启用打印机状态通知超时")
+                listening = True
+                payloads = []
+                for _ in range(samples):
+                    feedback.state_received.clear()
+                    await _write(client, STATE_QUERY)
+                    try:
+                        await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态",
+                                           "检查设备是否休眠或被其他 App 占用；当前不能判定纸张状态。") from None
+                    payloads.append(feedback.state_payloads[-1])
+                    if len(payloads) < samples:
+                        await asyncio.sleep(0.3)
+                status = interpret_status(payloads[-1], profile)
+                calibration_unavailable = (state / "status-profile.json").exists() and profile is None
+                if calibration_unavailable:
+                    status["summary"] = "已配置的故障检查规则不可用，打印将被阻止；请重新校准"
+                return {"reachable": True, "paper_used": False,
+                        "selected_printer": {"id": address, "name": DEVICE_NAME},
+                        "status_samples": [payload.hex() for payload in payloads], **status,
+                        "ok": not status["faults"] and not calibration_unavailable,
+                        "calibration_available": profile is not None,
+                        "calibration_required": calibration_unavailable,
+                        "battery": await read_battery(client)}
+        except PrinterFault as error:
+            failure = error
+            raise
+        except asyncio.TimeoutError:
+            failure = PrinterFault("printer_operation_timeout", "打印机操作超过总时限",
+                                   "检查打印机；如发送可能已经开始，请先核对实物，不要自动重打。",
+                                   phase="operation", output_uncertain=False)
+            raise failure from None
+        except asyncio.CancelledError as error:
+            failure = error
             raise
         except Exception as error:
-            raise PrinterFault("status_query_failed", "无法读取打印机状态",
-                               "检查打印机电源、蓝牙占用和权限；当前不能判断纸张或纸仓状态。") from error
+            failure = PrinterFault("status_query_failed", "无法读取打印机状态",
+                                   "检查打印机电源、蓝牙占用和权限；当前不能判断纸张或纸仓状态。")
+            raise failure from error
         finally:
-            if current_client is not None:
-                if listening:
-                    try:
-                        await current_client.stop_notify(NOTIFY_CHAR_UUID)
-                    except Exception:
-                        pass
-                try:
-                    await current_client.disconnect()
-                except Exception:
-                    pass
-                finally:
-                    current_client = None
+            await _cleanup(listening, failure, False)
 
 
 async def print_png(png_data: bytes, device_address: str | None = None,
@@ -522,96 +581,94 @@ async def print_png(png_data: bytes, device_address: str | None = None,
     post_send_reply = False
     bytes_queued = 0
     status = interpret_status(b"", status_profile)
-    async with print_lock:
+    failure = None
+    job_store.report_progress("waiting_for_printer")
+    async with runtime.hardware_queue(print_lock):
         try:
-            job_store.report_progress("checking_printer")
-            if device_address is not None and device_address != DEVICE_ADDRESS:
-                if current_client is not None:
-                    await current_client.disconnect()
-                    current_client = None
-                DEVICE_ADDRESS = device_address
-            client = await ensure_connected()
-            if hasattr(client, "start_notify"):
-                await client.start_notify(NOTIFY_CHAR_UUID, feedback.receive)
-                listening = True
-                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
-                try:
-                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
-                    raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态；本次未发送打印数据",
-                                       "检查设备是否休眠或被其他 App 占用，当前无法判断纸张和纸仓状态。") from None
-                status = interpret_status(feedback.state_payloads[-1], status_profile)
-                raise_for_faults(feedback.fault_reported or status, phase="preflight", output_uncertain=False)
-                feedback.state_received.clear()
-            elif status_profile and status_profile.get("rules"):
-                raise PrinterFault("status_unsupported", "当前连接不能执行已启用的故障检查，已停止打印",
-                                   "请恢复支持设备状态通知的连接后重试。")
-            data = bytearray()
-            data.extend(STATE_QUERY)
-            data.extend(QUALITY_200_DPI)
-            data.extend(set_energy(PRINT_ENERGY))
-            data.extend(APPLY_ENERGY)
-            data.extend(LATTICE_START)
-            for row in rows:
-                data.extend(print_row(row))
-            data.extend(feed_paper(25))
-            data.extend(SET_PAPER)
-            data.extend(LATTICE_END)
-            data.extend(STATE_QUERY)
-            for offset in range(0, len(data), 123):
-                if offset == 0:
-                    job_store.report_progress("sending")
-                if feedback.state_payloads:
+            async with asyncio.timeout(runtime.PRINT_TIMEOUT_SECONDS):
+                job_store.report_progress("checking_printer")
+                if device_address is not None and device_address != DEVICE_ADDRESS:
+                    if current_client is not None:
+                        await runtime.bounded(current_client.disconnect(), runtime.CLEANUP_TIMEOUT_SECONDS, "printer_disconnect_timeout", "切换设备时断开连接超时", phase="cleanup")
+                        current_client = None
+                    DEVICE_ADDRESS = device_address
+                client = await runtime.bounded(ensure_connected(), runtime.CONNECT_TIMEOUT_SECONDS + runtime.SCAN_TIMEOUT_SECONDS, "printer_connect_timeout", "查找或连接打印机超时")
+                if hasattr(client, "start_notify"):
+                    await runtime.bounded(client.start_notify(NOTIFY_CHAR_UUID, feedback.receive), runtime.NOTIFY_TIMEOUT_SECONDS, "printer_notify_timeout", "启用打印机状态通知超时")
+                    listening = True
+                    await _write(client, STATE_QUERY)
+                    try:
+                        await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                    except asyncio.TimeoutError:
+                        raise PrinterFault("status_timeout", "打印机已连接，但没有返回有效状态；本次未发送打印数据",
+                                           "检查设备是否休眠或被其他 App 占用，当前无法判断纸张和纸仓状态。") from None
                     status = interpret_status(feedback.state_payloads[-1], status_profile)
-                    raise_for_faults(feedback.fault_reported or status, phase="sending", output_uncertain=bytes_queued > 0)
-                bytes_queued += len(data[offset : offset + 123])
-                await client.write_gatt_char(
-                    WRITE_CHAR_UUID,
-                    data[offset : offset + 123],
-                    response=False,
-                )
-                await asyncio.sleep(CHUNK_DELAY_SECONDS)
-            # Writes without response only enqueue data. Keep BLE open while the tail drains.
-            await asyncio.sleep(TAIL_DRAIN_SECONDS)
-            if listening:
-                job_store.report_progress("awaiting_device_reply")
-                feedback.state_received.clear()
-                await client.write_gatt_char(WRITE_CHAR_UUID, STATE_QUERY, response=False)
-                try:
-                    await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
-                    post_send_reply = True
-                except asyncio.TimeoutError:
-                    raise PrinterFault("status_lost_after_send", "打印数据已发送，但设备停止返回状态，出纸结果不确定",
-                                       "请先检查打印机和纸张，程序不会自动重打。",
-                                       phase="post_send", output_uncertain=True) from None
-                status = interpret_status(feedback.state_payloads[-1], status_profile)
-                raise_for_faults(feedback.fault_reported or status, phase="post_send", output_uncertain=True)
-        except PrinterFault:
+                    raise_for_faults(feedback.fault_reported or status, phase="preflight", output_uncertain=False)
+                    feedback.state_received.clear()
+                elif status_profile and status_profile.get("rules"):
+                    raise PrinterFault("status_unsupported", "当前连接不能执行已启用的故障检查，已停止打印",
+                                       "请恢复支持设备状态通知的连接后重试。")
+                data = bytearray()
+                data.extend(STATE_QUERY)
+                data.extend(QUALITY_200_DPI)
+                data.extend(set_energy(PRINT_ENERGY))
+                data.extend(APPLY_ENERGY)
+                data.extend(LATTICE_START)
+                for row in rows:
+                    data.extend(print_row(row))
+                data.extend(feed_paper(25))
+                data.extend(SET_PAPER)
+                data.extend(LATTICE_END)
+                data.extend(STATE_QUERY)
+                for offset in range(0, len(data), 123):
+                    if offset == 0:
+                        job_store.report_progress("sending")
+                    if feedback.state_payloads:
+                        status = interpret_status(feedback.state_payloads[-1], status_profile)
+                        raise_for_faults(feedback.fault_reported or status, phase="sending", output_uncertain=bytes_queued > 0)
+                    bytes_queued += len(data[offset : offset + 123])
+                    await _write(client, data[offset : offset + 123], uncertain=True, phase="sending")
+                    await asyncio.sleep(CHUNK_DELAY_SECONDS)
+                # Writes without response only enqueue data. Keep BLE open while the tail drains.
+                await asyncio.sleep(TAIL_DRAIN_SECONDS)
+                if listening:
+                    job_store.report_progress("awaiting_device_reply")
+                    feedback.state_received.clear()
+                    await _write(client, STATE_QUERY, uncertain=True, phase="post_send")
+                    try:
+                        await asyncio.wait_for(feedback.state_received.wait(), STATUS_TIMEOUT_SECONDS)
+                        post_send_reply = True
+                    except asyncio.TimeoutError:
+                        raise PrinterFault("status_lost_after_send", "打印数据已发送，但设备停止返回状态，出纸结果不确定",
+                                           "请先检查打印机和纸张，程序不会自动重打。",
+                                           phase="post_send", output_uncertain=True) from None
+                    status = interpret_status(feedback.state_payloads[-1], status_profile)
+                    raise_for_faults(feedback.fault_reported or status, phase="post_send", output_uncertain=True)
+        except PrinterFault as error:
+            failure = error
+            raise
+        except asyncio.TimeoutError:
+            failure = PrinterFault("printer_operation_timeout", "打印机操作超过总时限",
+                                   "检查打印机；如发送可能已经开始，请先核对实物，不要自动重打。",
+                                   phase="operation", output_uncertain=bool(bytes_queued))
+            raise failure from None
+        except asyncio.CancelledError as error:
+            failure = error
             raise
         except Exception as error:
             normalized = normalize_error(error, phase="sending" if bytes_queued else "preflight",
                                          output_uncertain=bool(bytes_queued))
             if normalized.code.startswith("storage_"):
+                failure = normalized
                 raise normalized from error
-            raise PrinterFault("transfer_failed" if bytes_queued else "printer_check_failed",
+            failure = PrinterFault("transfer_failed" if bytes_queued else "printer_check_failed",
                                "蓝牙发送中断，出纸结果不确定" if bytes_queued else "打印前设备检查失败，未发送打印数据",
                                "检查打印机电源、距离和蓝牙占用；如已开始出纸，请先核对实物，程序不会自动重打。",
                                phase="sending" if bytes_queued else "preflight",
-                               output_uncertain=bool(bytes_queued)) from error
+                               output_uncertain=bool(bytes_queued))
+            raise failure from error
         finally:
-            # Finish cleanup while holding the same lock as checks and disconnects.
-            if current_client is not None:
-                if listening:
-                    try:
-                        await current_client.stop_notify(NOTIFY_CHAR_UUID)
-                    except Exception:
-                        pass
-                try:
-                    await current_client.disconnect()
-                except Exception:
-                    pass
-                finally:
-                    current_client = None
+            await _cleanup(listening, failure, bool(bytes_queued))
 
     return {"data_sent": True, "physical_output_verified": False,
             "rows": len(rows), "bytes_sent": len(data),
@@ -621,19 +678,39 @@ async def print_png(png_data: bytes, device_address: str | None = None,
             "feedback_commands": [f"{code:02x}" for code in sorted(feedback.commands)]}
 
 
-async def send_stored_png(state: Path, png_data: bytes) -> dict:
-    address = configured_address(state)
+async def send_stored_png(state: Path, png_data: bytes, *, target: dict | None = None) -> dict:
+    address = target["id"] if target else configured_address(state)
     profile = load_profile(state, address)
     if (state / "status-profile.json").exists() and profile is None:
         raise fault("calibration_unavailable", phase="preflight")
+    if address is None:
+        address = (await resolve_print_target(state))["id"]
     return await print_png(png_data, device_address=address, status_profile=profile)
+
+
+@mcp.tool()
+async def list_printers() -> dict[str, Any]:
+    """Scan matching PD01 printers and show local device IDs for explicit selection. Never connects or prints."""
+    try:
+        return await list_available_printers(job_store.default_state())
+    except Exception as error:
+        return normalize_error(error, phase="selection").as_result()
+
+
+@mcp.tool()
+async def select_printer(device_id: str) -> dict[str, Any]:
+    """Select one PD01 from the scan list for future jobs. Existing confirmation windows retain their original target."""
+    try:
+        return await select_target(job_store.default_state(), device_id)
+    except Exception as error:
+        return normalize_error(error, phase="selection").as_result()
 
 
 @mcp.tool()
 async def check_printer() -> dict[str, Any]:
     """Query device status and report validated faults. Does not print or feed paper."""
     try:
-        return await diagnose_printer(job_store.default_state())
+        return await diagnose_printer(job_store.default_state(), check_channel=True)
     except PrinterFault as error:
         return error.as_result()
     except Exception as error:
@@ -722,10 +799,15 @@ async def report_blank_output(job_id: str) -> dict[str, Any]:
 async def print_prepared(job_id: str, confirmation: str) -> dict[str, Any]:
     """Open a local Mac preview window. Only the local Confirm Print button allows one send. Closing/cancelling never prints."""
     state = job_store.default_state()
+    frozen_target = None
+    async def resolve():
+        nonlocal frozen_target
+        frozen_target = await resolve_print_target(state)
+        return frozen_target
     async def sender(png):
-        return await send_stored_png(state, png)
+        return await send_stored_png(state, png, target=frozen_target)
     try:
-        return await job_store.dispatch(state, job_id, confirmation, sender)
+        return await job_store.dispatch(state, job_id, confirmation, sender, resolve_target=resolve)
     except PrinterFault as error:
         return error.as_result()
     except Exception as error:
@@ -736,12 +818,11 @@ async def print_prepared(job_id: str, confirmation: str) -> dict[str, Any]:
 async def disconnect_printer() -> dict[str, Any]:
     """Disconnect the BLE printer. Does not print or feed paper."""
     global current_client
-    async with print_lock:
-        if current_client is not None:
-            try:
-                await current_client.disconnect()
-            finally:
-                current_client = None
+    try:
+        async with runtime.hardware_queue(print_lock):
+            await _cleanup(False, None, False)
+    except Exception as error:
+        return normalize_error(error, phase="cleanup").as_result()
     return {"disconnected": True, "paper_used": False}
 
 

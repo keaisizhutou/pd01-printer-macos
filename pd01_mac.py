@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -50,42 +49,21 @@ def prepare_mixed(state: Path, manifest: Path) -> dict:
 
 
 async def check(state: Path) -> dict:
-    from bleak import BleakClient, BleakScanner
-    try:
-        discovered = await BleakScanner.discover(timeout=10, return_adv=True)
-    except Exception as error:
-        raise PrinterFault("printer_search_failed", "蓝牙扫描失败",
-                           "检查 Mac 蓝牙是否开启，以及当前程序是否有蓝牙权限。") from error
-    devices = [device for device, adv in discovered.values()
-               if (adv.local_name or device.name or "") == driver.DEVICE_NAME]
-    requested_id = os.getenv("PD01_DEVICE_ADDRESS", "").strip()
-    if requested_id:
-        devices = [device for device in devices if device.address == requested_id]
-    if not devices:
-        raise PrinterFault("printer_not_found", "没有发现目标打印机",
-                           "唤醒打印机并靠近 Mac，关闭手机打印 App，再检查蓝牙权限。")
-    if len(devices) != 1:
-        raise PrinterFault("multiple_printers_found", "发现多台同名打印机，尚未选择目标",
-                           "关闭其他同名设备，或先指定要使用的打印机。")
-    device = devices[0]
-    async with BleakClient(device, timeout=20) as client:
-        char = client.services.get_characteristic(driver.WRITE_CHAR_UUID)
-        if char is None or "write-without-response" not in char.properties:
-            raise PrinterFault("write_channel_unavailable", "设备没有提供兼容的打印通道",
-                               "确认设备型号与本项目兼容，不要向未识别通道发送打印指令。")
-        if char.max_write_without_response_size < 123:
-            raise PrinterFault("write_chunk_unsupported", "设备的蓝牙写入容量不满足当前驱动要求",
-                               "暂时停止发送，需要适配该设备的分包大小。")
-        job_store.save_json(state / "device.json", {"id": device.address, "name": device.name})
-        return {"connected": bool(client.is_connected), "compatible_write_channel": True,
-                "paper_used": False}
+    result = await driver.diagnose_printer(state, check_channel=True)
+    return {**result, "connected": result["reachable"], "compatible_write_channel": True}
 
 
 async def print_job(state: Path, job_id: str, confirmation: str, sender=None) -> dict:
+    resolver = None
     if sender is None:
+        frozen_target = None
+        async def resolver():
+            nonlocal frozen_target
+            frozen_target = await driver.resolve_print_target(state)
+            return frozen_target
         async def sender(png):
-            return await driver.send_stored_png(state, png)
-    return await job_store.dispatch(state, job_id, confirmation, sender)
+            return await driver.send_stored_png(state, png, target=frozen_target)
+    return await job_store.dispatch(state, job_id, confirmation, sender, resolve_target=resolver)
 
 
 def main() -> None:
@@ -93,6 +71,9 @@ def main() -> None:
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
     actions = parser.add_subparsers(dest="action", required=True)
     actions.add_parser("check", help="Connect and inspect the write channel without using paper")
+    actions.add_parser("printers", help="List matching printers for explicit selection")
+    selecting = actions.add_parser("select-printer", help="Select one printer from the scan list")
+    selecting.add_argument("device_id")
     status_action = actions.add_parser("status", help="Query printer status without printing or feeding paper")
     status_action.add_argument("--samples", type=int, default=1)
     status_action.add_argument("--sample-label", choices=("normal", "cover_open", "paper_missing", "recovered"))
@@ -119,6 +100,10 @@ def main() -> None:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.action == "check":
         result = asyncio.run(check(state))
+    elif args.action == "printers":
+        result = asyncio.run(driver.list_available_printers(state))
+    elif args.action == "select-printer":
+        result = asyncio.run(driver.select_target(state, args.device_id))
     elif args.action == "status":
         result = asyncio.run(driver.diagnose_printer(state, args.samples))
         if args.sample_label:
@@ -128,7 +113,7 @@ def main() -> None:
             folder.mkdir(exist_ok=True, mode=0o700)
             record = {"label": args.sample_label, "samples": result["status_samples"],
                       "timestamp": datetime.now(timezone.utc).isoformat(),
-                      "device_id_sha256": hashlib.sha256(driver.configured_address(state).encode()).hexdigest()}
+                      "device_id_sha256": hashlib.sha256(result["selected_printer"]["id"].encode()).hexdigest()}
             job_store.save_json(folder / f'{args.sample_label}.json', record)
     elif args.action == "setup-confirmation":
         from native_confirmation import build_helper

@@ -13,4 +13,6 @@ Further adaptations add ordered text/image layouts to CLI and MCP, preparation l
 
 Reported blank-output troubleshooting is available through CLI and MCP. It inspects the saved preview and returns paper-loading checks without diagnosing a reversed roll from sensor data or triggering another print.
 
+CLI and MCP now share explicit printer selection and a per-user OS file-lock queue across processes and state directories. Bluetooth stages and complete operations have deadlines, with bounded cleanup and no automatic replay. The local confirmation response is also bound to the selected printer, so later configuration changes cannot redirect an approved job.
+
 Upstream credits [rhnvrm/catprinter](https://github.com/rhnvrm/catprinter) (MIT) for public reverse-engineering work on command framing and GATT details. The original copyright and MIT license are retained in LICENSE.

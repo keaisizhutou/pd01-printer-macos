@@ -34,6 +34,10 @@ class MCPWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.font = patch.object(server, '_load_font', side_effect=lambda size: ImageFont.load_default(size=size))
         self.font.start()
         self.addCleanup(self.font.stop)
+        self.target = patch.object(server, 'resolve_print_target', new_callable=AsyncMock,
+                                   return_value={'id': 'test-device', 'name': 'PD01'})
+        self.target.start()
+        self.addCleanup(self.target.stop)
 
     async def test_mcp_returns_exact_stored_png_and_default_layout(self):
         async with Client(server.mcp) as client:

@@ -65,6 +65,8 @@ def parse_decision(output: bytes, returncode: int, request: dict) -> Confirmatio
     if not isinstance(result, dict) or any(result.get(key) != request[key]
                                           for key in ("job_id", "nonce", "sha256", "purpose")):
         raise fault("confirmation_response_invalid", phase="confirmation")
+    if result.get("printer_id") != request.get("printer_id"):
+        raise fault("confirmation_response_invalid", phase="confirmation")
     if result.get("approved") is True and result.get("reason") == "approved":
         return ConfirmationDecision(True, "approved")
     if result.get("approved") is False and result.get("reason") in ("cancelled", "window_closed"):
@@ -82,9 +84,10 @@ async def request_confirmation(metadata: dict, png: bytes, *, demo: bool = False
         "image": base64.b64encode(png).decode("ascii"),
         "fontSize": metadata["font_size"], "align": metadata["align"],
         "kind": metadata.get("kind", "text"),
+        "printer_id": metadata.get("printer_id"), "printerName": metadata.get("printer_name"),
     }
     # Swift uses camelCase for the one field; the response uses the job-store spelling.
-    payload = {**request, "jobID": request["job_id"]}
+    payload = {**request, "jobID": request["job_id"], "printerID": request["printer_id"]}
     try:
         process = await asyncio.create_subprocess_exec(
             str(binary), stdin=asyncio.subprocess.PIPE,
